@@ -18,6 +18,13 @@ int main() {
             out.numeric.count("total_m3")==1,
             "water fields unavailable");
     }
+    check(decode(w,out,"mkradio4"), "explicit water driver rejected");
+    check(!decode(w,out,"fhkvdataiii") && out.numeric.empty(),
+          "heat driver accepted for water");
+    check(!decode(w,out,"mkradio4a") && out.numeric.empty(),
+          "unvalidated mkradio4a must not be silently activated");
+    check(!decode(w,out,"bad") && out.numeric.empty(),
+          "unknown driver admitted");
     w.trust=Trust::Unknown;
     check(!decode(w,out) && out.numeric.empty(), "unknown security admitted");
     w.trust=Trust::Ciphertext;
@@ -34,6 +41,9 @@ int main() {
       for (auto field: {"current_hca","previous_hca","temp_room_c","temp_radiator_c"})
         check(out.numeric.count(field)==1, "missing heat field");
     }
+    check(decode(h,out,"fhkvdataiii"), "explicit heat driver rejected");
+    check(!decode(h,out,"mkradio4") && out.numeric.empty(),
+          "water driver accepted for heat");
     h.trust=Trust::Unknown;
     check(!decode(h,out) && out.numeric.empty(), "heat without trust admitted");
     std::cout << "XMQ_STANDALONE_HOST_OK: 7 heat + 5 water logical contracts, "

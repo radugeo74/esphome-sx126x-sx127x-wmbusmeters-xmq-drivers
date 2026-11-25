@@ -74,3 +74,28 @@ its entries with host tests. The standalone engine now looks up existing
 individual C++ source functions. This **does not yet enable new meter types
 through YAML**. The stable `main` branch is unchanged; do not flash this
 experimental branch until its CI and hardware testing are complete.
+
+## Experimental YAML driver selection (supported formats only)
+
+In `experimental/xmq-auto-drivers`, `xmq_meter` now accepts optional
+`driver: auto` (default), `driver: fhkvdataiii` for heat, and
+`driver: mkradio4` for water. The explicit driver is checked against the
+meter family and the driver's actual MVT detection. Unknown, mismatched,
+or unvalidated drivers fail closed; no stale sensor values are published.
+
+Example:
+
+```yaml
+xmq_meter:
+  - radio_id: receiver
+    meter_id: 0x12345000
+    family: heat
+    driver: fhkvdataiii
+    current_hca:
+      name: Example Heat
+```
+
+The independent `mkradio4a.xmq` is discoverable in the generated
+catalog but is **not** enabled for production decoding by this change;
+its security envelope, field projection and fixtures need separate tests.
+No claim is made of universal automatic decoding for arbitrary XMQ files.

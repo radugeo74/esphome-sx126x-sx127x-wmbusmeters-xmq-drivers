@@ -51,7 +51,7 @@ void Meter::handle_frame_(wmbus_radio::Frame *frame) {
       xmq_standalone::Trust::VerifiedCleartext};
   xmq_runtime::XmqFrameResult output;
   const uint32_t start = micros();
-  if (!xmq_standalone::decode(in, output)) {
+  if (!xmq_standalone::decode(in, output, this->driver_)) {
     ESP_LOGW(TAG, "XMQ primary incomplete: suppressing stale sensor values");
     return;
   }

@@ -18,9 +18,14 @@ struct Input {
   std::vector<std::uint8_t> application;
   Trust trust{Trust::Unknown};
 };
-inline bool decode(const Input &input, xmq_runtime::XmqFrameResult &out) noexcept {
+inline bool decode(const Input &input, xmq_runtime::XmqFrameResult &out,
+                   const std::string &explicit_driver = "auto") noexcept {
   out = {};
   if (input.trust != Trust::VerifiedCleartext) return false;
+  if (explicit_driver != "auto" && explicit_driver != "fhkvdataiii" &&
+      explicit_driver != "mkradio4") return false;
+  if (input.family == Family::Heat && explicit_driver == "mkradio4") return false;
+  if (input.family == Family::Water && explicit_driver == "fhkvdataiii") return false;
   try {
     if (input.family == Family::Heat) {
       static const xmq_runtime::DriverRegistry registry({

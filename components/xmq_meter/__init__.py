@@ -22,12 +22,14 @@ FIELDS = ("current_hca", "previous_hca", "temp_room_c", "temp_radiator_c",
 CONF_RADIO_ID = "radio_id"
 CONF_METER_ID = "meter_id"
 CONF_FAMILY = "family"
+CONF_DRIVER = "driver"
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(Meter),
     cv.Required(CONF_RADIO_ID): cv.use_id(RadioComponent),
     cv.Required(CONF_METER_ID): cv.hex_int,
     cv.Required(CONF_FAMILY): cv.one_of("heat", "water", lower=True),
+    cv.Optional(CONF_DRIVER, default="auto"): cv.one_of("auto", "fhkvdataiii", "mkradio4", lower=True),
     **{cv.Optional(name): sensor.sensor_schema(accuracy_decimals=1)
        for name in FIELDS},
 }).extend(cv.COMPONENT_SCHEMA)
@@ -40,6 +42,7 @@ async def to_code(config):
     cg.add_build_flag("-DXMQ_STANDALONE_ONLY=1")
     var = cg.new_Pvariable(config[CONF_ID])
     cg.add(var.set_meter(config[CONF_METER_ID], config[CONF_FAMILY] == "heat"))
+    cg.add(var.set_driver(config[CONF_DRIVER]))
     radio = await cg.get_variable(config[CONF_RADIO_ID])
     cg.add(var.set_radio(radio))
     for name in FIELDS:

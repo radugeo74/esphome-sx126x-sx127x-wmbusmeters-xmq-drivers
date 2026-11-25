@@ -61,6 +61,7 @@ xmq_meter:
     radio_id: receiver
     meter_id: 0x12345000
     family: heat
+    driver: fhkvdataiii
     current_hca:
       name: "CI XMQ Heat 1 current_hca"
     previous_hca:
@@ -159,6 +160,7 @@ xmq_meter:
     radio_id: receiver
     meter_id: 0x12345007
     family: water
+    driver: mkradio4
     target_m3:
       name: "CI XMQ Water 8 target_m3"
     total_m3:
