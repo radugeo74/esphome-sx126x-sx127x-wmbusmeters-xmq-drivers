@@ -4,6 +4,7 @@ Source of truth: drivers/<name>.xmq. Never edit generated header.
 The generator runs during ESPHome component loading and in CI host tests.
 """
 from pathlib import Path
+import hashlib
 import json
 import re
 
@@ -38,7 +39,8 @@ def generate_driver_header(component_dir: Path) -> Path:
             raise ValueError("XMQ driver name mismatch: " + path.name)
         if "driver {" not in content:
             raise ValueError("Missing XMQ driver block: " + path.name)
-        delimiter = "XMQ_" + name.upper()
+        # C++ raw string delimiters must not exceed 16 characters.
+        delimiter = "X" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
         if ")" + delimiter + '"' in content:
             raise ValueError("Invalid embedded raw-string delimiter: " + path.name)
         declarations.extend([
