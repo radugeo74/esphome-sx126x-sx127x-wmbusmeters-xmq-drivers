@@ -160,3 +160,15 @@ keys in this repository or CI fixtures. Do not mark ciphertext as verified
 plaintext. Later implementation requires protocol-specific authenticated
 verification (or independently validated integrity strategy) before any
 sensor publication.
+
+### Host-only AES-128-CBC reference vector test
+
+`tests/test_aes_cbc_nist_vector.py` checks OpenSSL against the published
+NIST SP 800-38A F.2.1 four-block AES-128-CBC vectors. It additionally checks
+wrong key/IV, truncated ciphertext and the predictable IV bit-flip effect.
+This demonstrates CBC **malleability**, so decryption alone cannot establish
+telegram authenticity, integrity, meter binding, freshness or authorization to
+publish. No encrypted data is passed to `standalone_engine`; the pending
+runtime adapter continues to reject all encrypted telegrams. The actual
+OMS security mode, IV construction, key derivation and replay policy are
+still unimplemented pending protocol-specific reference frames.
