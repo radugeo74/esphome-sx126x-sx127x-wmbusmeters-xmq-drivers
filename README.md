@@ -211,3 +211,12 @@ previous test-local copy has been removed, so tests exercise the same
 implementation that controls publication. Unknown transport, mismatched
 explicit driver, mismatched MVT/family and ciphertext all clear output and
 reject before any sensor publish. No encryption features were enabled.
+
+### Transport prefix collision guard
+
+The generated transport allowlist now rejects **overlapping signatures**
+sharing version/type/CI, including exact duplicates, shorter/longer matching
+prefixes, different drivers and clear-form versus encrypted-pending entries.
+This prevents a shorter clear-form signature from bypassing the future
+`encrypted_pending` gate. The existing reviewed 14 signatures are unchanged;
+CI checks both negative collisions and a non-overlapping pending entry.

@@ -114,7 +114,10 @@ def generate_driver_header(component_dir: Path) -> Path:
         "inline const TransportSignature *transport_signature_catalog(std::size_t &count) {",
         "  static const TransportSignature signatures[] = {",
     ])
-    duplicate = set()
+    # Reject ALL overlapping signatures, not only exact duplicates.
+    # A shorter clear-form prefix must never shadow an encrypted_pending one,
+    # even for the same approved driver and identical MVT.
+    prior_signatures = []
     for item in signatures:
         if not isinstance(item, dict) or set(item) != {"driver", "version", "type", "ci", "prefix", "security"}:
             raise ValueError("Invalid XMQ transport signature")
@@ -131,10 +134,17 @@ def generate_driver_header(component_dir: Path) -> Path:
             type(v) is not int or not (0 <= v <= 255) for v in prefix
         ):
             raise ValueError("Invalid XMQ transport prefix")
-        key = (name, version, typ, ci, tuple(prefix))
-        if key in duplicate:
-            raise ValueError("Duplicate XMQ transport signature")
-        duplicate.add(key)
+        for earlier in prior_signatures:
+            old_name, old_version, old_type, old_ci, old_prefix, old_security = earlier
+            if (version, typ, ci) != (old_version, old_type, old_ci):
+                continue
+            common = min(len(prefix), len(old_prefix))
+            if prefix[:common] == old_prefix[:common]:
+                raise ValueError(
+                    "Overlapping XMQ transport signatures: "
+                    + old_name + "/" + old_security + " and " + name + "/" + security
+                )
+        prior_signatures.append((name, version, typ, ci, prefix, security))
         padded = prefix + [0] * (3 - len(prefix))
         declarations.append(
             f'    {{"{name}", {version}, {typ}, {ci}, {len(prefix)}, {0 if security == "clear_form" else 1}, '
