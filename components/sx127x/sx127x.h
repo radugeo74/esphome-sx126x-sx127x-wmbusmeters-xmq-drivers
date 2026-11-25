@@ -1,0 +1,381 @@
+#pragma once
+
+#include "sx127x_reg.h"
+#include "esphome/components/spi/spi.h"
+#include "esphome/core/automation.h"
+#include "esphome/core/component.h"
+#include "esphome/core/hal.h"
+#include <vector>
+#include <array>
+#include <atomic>
+#include <string>
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+namespace esphome::sx127x {
+
+static constexpr size_t SX127X_MAX_PACKET_SIZE = 255;  // the payload length register is 8 bits
+
+enum SX127xBw : uint8_t {
+  SX127X_BW_2_6,
+  SX127X_BW_3_1,
+  SX127X_BW_3_9,
+  SX127X_BW_5_2,
+  SX127X_BW_6_3,
+  SX127X_BW_7_8,
+  SX127X_BW_10_4,
+  SX127X_BW_12_5,
+  SX127X_BW_15_6,
+  SX127X_BW_20_8,
+  SX127X_BW_25_0,
+  SX127X_BW_31_3,
+  SX127X_BW_41_7,
+  SX127X_BW_50_0,
+  SX127X_BW_62_5,
+  SX127X_BW_83_3,
+  SX127X_BW_100_0,
+  SX127X_BW_125_0,
+  SX127X_BW_166_7,
+  SX127X_BW_200_0,
+  SX127X_BW_250_0,
+  SX127X_BW_500_0,
+};
+
+enum class SX127xError { NONE = 0, TIMEOUT, INVALID_PARAMS };
+enum class WmbusDecodeResult : uint8_t {
+  T1_VERIFIED, C1A_VERIFIED, C1B_VERIFIED,
+  BAD_SYMBOL, BAD_CRC, BAD_LENGTH
+};
+
+class SX127xListener {
+ public:
+  virtual void on_packet(const std::vector<uint8_t> &packet, float rssi, float snr) = 0;
+};
+
+class SX127x final : public Component,
+                     public spi::SPIDevice<spi::BIT_ORDER_MSB_FIRST, spi::CLOCK_POLARITY_LOW, spi::CLOCK_PHASE_LEADING,
+                                           spi::DATA_RATE_8MHZ> {
+ public:
+  size_t get_max_packet_size();
+  float get_setup_priority() const override { return setup_priority::PROCESSOR; }
+  void setup() override;
+  void loop() override;
+  void dump_config() override;
+  void set_auto_cal(bool auto_cal) { this->auto_cal_ = auto_cal; }
+  void set_bandwidth(SX127xBw bandwidth) { this->bandwidth_ = bandwidth; }
+  void set_bitrate(uint32_t bitrate) { this->bitrate_ = bitrate; }
+  void set_bitsync(bool bitsync) { this->bitsync_ = bitsync; }
+  void set_coding_rate(uint8_t coding_rate) { this->coding_rate_ = coding_rate; }
+  void set_crc_enable(bool crc_enable) { this->crc_enable_ = crc_enable; }
+  void set_deviation(uint32_t deviation) { this->deviation_ = deviation; }
+  void set_dio0_pin(InternalGPIOPin *dio0_pin) { this->dio0_pin_ = dio0_pin; }
+  void set_frequency(uint32_t frequency) { this->frequency_ = frequency; }
+  void set_mode_rx();
+  void set_mode_tx();
+  void set_mode_standby();
+  void set_mode_sleep();
+  void set_modulation(uint8_t modulation) { this->modulation_ = modulation; }
+  void set_pa_pin(uint8_t pin) { this->pa_pin_ = pin; }
+  void set_pa_power(uint8_t power) { this->pa_power_ = power; }
+  void set_pa_ramp(uint8_t ramp) { this->pa_ramp_ = ramp; }
+  void set_packet_mode(bool packet_mode) { this->packet_mode_ = packet_mode; }
+  void set_payload_length(uint8_t payload_length) { this->payload_length_ = payload_length; }
+  void set_preamble_errors(uint8_t preamble_errors) { this->preamble_errors_ = preamble_errors; }
+  void set_preamble_polarity(uint8_t preamble_polarity) { this->preamble_polarity_ = preamble_polarity; }
+  void set_preamble_size(uint16_t preamble_size) { this->preamble_size_ = preamble_size; }
+  void set_preamble_detect(uint8_t preamble_detect) { this->preamble_detect_ = preamble_detect; }
+  void set_rst_pin(InternalGPIOPin *rst_pin) { this->rst_pin_ = rst_pin; }
+  void set_rx_floor(float floor) { this->rx_floor_ = floor; }
+  void set_rx_start(bool start) { this->rx_start_ = start; }
+  void set_afc_auto(bool enabled) { this->afc_auto_ = enabled; }
+  void set_agc_auto(bool enabled) { this->agc_auto_ = enabled; }
+  void set_lna_gain(uint8_t gain) { this->lna_gain_ = gain; }
+  void set_shaping(uint8_t shaping) { this->shaping_ = shaping; }
+  void set_spreading_factor(uint8_t spreading_factor) { this->spreading_factor_ = spreading_factor; }
+  void set_sync_value(const std::vector<uint8_t> &sync_value) { this->sync_value_ = sync_value; }
+  void run_image_cal();
+  void configure();
+  SX127xError transmit_packet(const uint8_t *data, size_t len);
+  SX127xError transmit_packet(const std::vector<uint8_t> &packet) {
+    return this->transmit_packet(packet.data(), packet.size());
+  }
+  void register_listener(SX127xListener *listener) { this->listeners_.push_back(listener); }
+  // Native wM-Bus T1: drain FIFO continuously, before its 64-byte capacity
+  // is reached. The callback runs on the ESPHome main loop, not the ISR.
+  using WmbusStreamCallback = void (*)(void *, const uint8_t *, size_t, float);
+  void set_wmbus_t1_mode(bool value) { this->wmbus_t1_mode_ = value; }
+  void set_wmbus_raw_dclk(bool value) { this->wmbus_raw_dclk_ = value; }
+  void set_wmbus_raw_diag_capture(bool value) { this->wmbus_raw_diag_capture_ = value; }
+  void set_wmbus_t1_recovery_diag(bool value) { this->wmbus_t1_recovery_diag_ = value; }
+  void register_recovery_meter_id(const std::string &id);
+  void set_dio2_pin(InternalGPIOPin *pin) { this->dio2_pin_ = pin; }
+  void set_wmbus_c1_mode(bool value) { this->wmbus_c1_mode_ = value; }
+  // Standalone experimental RX: hardware detects both 0x54 and 0xCD.
+  // With this flag the first FIFO byte is C1/A L, not the 0xCD marker.
+  void set_wmbus_c1a_only(bool value) { this->wmbus_c1a_only_ = value; }
+  // Opt-in hybrid hardware-sync windows for SX1276; do not use the unreliable
+  // common one-byte 54 sync for C1/A in this mode.
+  void set_wmbus_dual_sync(bool value) { this->wmbus_dual_sync_ = value; }
+  // Opt-in continuous common 54 sync with RSSI-triggered AFC/AGC.
+  // Both 3D (T1/C1B) and CD (C1A) markers remain in FIFO.
+  void set_wmbus_continuous_dual(bool value) { this->wmbus_continuous_dual_ = value; }
+  void set_wmbus_lna_boost_hf(bool value) { this->wmbus_lna_boost_hf_ = value; }
+  void set_wmbus_diagnostics(bool enabled) { this->wmbus_phy_diagnostics_ = enabled; }
+  void note_wmbus_decode_result(WmbusDecodeResult event);
+  void set_dio1_pin(InternalGPIOPin *pin) { this->dio1_pin_ = pin; }
+  void set_wmbus_stream_callback(WmbusStreamCallback callback, void *context) {
+    this->wmbus_stream_callback_ = callback;
+    this->wmbus_stream_context_ = context;
+  }
+  Trigger<std::vector<uint8_t>, float, float> *get_packet_trigger() { return &this->packet_trigger_; }
+
+ protected:
+  static void IRAM_ATTR gpio_intr(SX127x *arg);
+  static void IRAM_ATTR wmbus_fifo_intr_(SX127x *arg);
+  static void IRAM_ATTR wmbus_raw_dclk_intr_(SX127x *arg);
+  void wmbus_raw_task_();
+  static void wmbus_task_entry_(void *ctx);
+  void wmbus_task_();
+  enum class WmbusReadStatus : uint8_t { COMPLETE, TIMEOUT, OVERRUN };
+  WmbusReadStatus wmbus_read_fifo_(uint8_t *buffer, size_t length,
+                                   int64_t deadline_us);
+  void wmbus_restart_rx_();
+  void wmbus_log_statistics_();
+  void log_raw_diag_captures_();
+  static void wmbus_recovery_task_entry_(void *ctx);
+  void wmbus_recovery_task_();
+  void configure_fsk_ook_();
+  void configure_lora_();
+  void set_mode_(uint8_t modulation, uint8_t mode);
+  void write_fifo_(const uint8_t *data, size_t len);
+  void read_fifo_(std::vector<uint8_t> &packet);
+  void write_register_(uint8_t reg, uint8_t value);
+  void call_listeners_(const std::vector<uint8_t> &packet, float rssi, float snr);
+  uint8_t read_register_(uint8_t reg);
+  Trigger<std::vector<uint8_t>, float, float> packet_trigger_;
+  std::vector<SX127xListener *> listeners_;
+  std::vector<uint8_t> packet_;
+  std::vector<uint8_t> sync_value_;
+  InternalGPIOPin *dio0_pin_{nullptr};
+  InternalGPIOPin *rst_pin_{nullptr};
+  InternalGPIOPin *dio1_pin_{nullptr};
+  InternalGPIOPin *dio2_pin_{nullptr};
+  static constexpr size_t WMBUS_MAX_RAW_SIZE = 384;
+  struct WmbusRxPacket {
+    uint16_t size{0};
+    int16_t rssi_half_dbm{0};
+    uint8_t t1_preamble_quality{2};  // 0 exact, 1 near2, 2 absent; RAW T1 only
+    uint8_t dclk_long_windows{0};  // windows fully inside candidate's body; saturating
+    std::array<uint8_t, WMBUS_MAX_RAW_SIZE> bytes{};
+  };
+  WmbusStreamCallback wmbus_stream_callback_{nullptr};
+  void *wmbus_stream_context_{nullptr};
+  QueueHandle_t wmbus_rx_queue_{nullptr};
+  TaskHandle_t wmbus_task_handle_{nullptr};
+  bool wmbus_t1_mode_{false};
+  bool wmbus_raw_dclk_{false};
+  bool wmbus_raw_diag_capture_{false};
+  bool wmbus_t1_recovery_diag_{false};
+  struct T1RecoveryJob {
+    uint16_t size{0};
+    std::array<uint8_t, 128> raw{};
+  };
+  QueueHandle_t t1_recovery_queue_{nullptr};
+  TaskHandle_t t1_recovery_task_handle_{nullptr};
+  std::atomic<uint32_t> t1_recovery_submitted_{0}, t1_recovery_dropped_{0};
+  std::atomic<uint32_t> t1_recovery_crc_valid_{0}, t1_recovery_crc_fail_{0};
+  std::atomic<uint32_t> t1_recovery_skipped_{0}, t1_recovery_time_budget_{0};
+  std::atomic<uint32_t> t1_recovery_coherent_{0}, t1_recovery_configured_{0};
+  std::atomic<uint32_t> t1_recovery_unconfigured_{0}, t1_recovery_ambiguous_{0};
+  // Exact 8-digit BCD IDs only. Store values before publishing atomic count.
+  std::array<std::atomic<uint32_t>, 32> t1_recovery_meter_ids_{};
+  std::atomic<unsigned> t1_recovery_meter_count_{0};
+  static constexpr uint8_t RAW_DIAG_MAX_SAMPLES = 6;
+  struct RawDiagCapture {
+    std::array<uint8_t, 128> data{};
+    uint8_t size{0};
+    uint16_t first_bad{0};
+    int16_t rssi_half_dbm{0};
+    uint8_t preamble_quality{2};
+    uint16_t symbols_total{0}, symbols_invalid{0};
+    uint16_t min_distance_1{0}, min_distance_2{0}, min_distance_3plus{0};
+    // Post-first-error, fixed 24-symbol window. Scores never affect RX.
+    uint8_t post_symbols{0};
+    std::array<uint8_t, 6> post_valid{};
+    std::array<uint8_t, 6> post_longest_run{};
+  };
+  // Stored in RAM until reboot; no flash writes or RX behavior changes.
+  std::array<RawDiagCapture, RAW_DIAG_MAX_SAMPLES> raw_diag_captures_{};
+  uint8_t raw_diag_samples_logged_{0};  // main loop only, bounded per boot
+  std::atomic<uint32_t> raw_diag_nested_sync_all_{0};
+  std::atomic<uint32_t> raw_diag_nested_sync_credible_{0};
+  static constexpr uint32_t RAW_RING_SIZE = 4096;
+  std::array<uint8_t, RAW_RING_SIZE> raw_ring_{};
+  // One tag per received octet. Set only when a 256-DCLK timing window
+  // completes at this octet, and its duration exceeds the existing limit.
+  std::array<uint8_t, RAW_RING_SIZE> raw_ring_dclk_long_{};
+  std::atomic<uint32_t> raw_head_{0}, raw_tail_{0};
+  uint8_t raw_bit_accum_{0}, raw_bit_count_{0};  // ISR only
+  gpio_num_t raw_data_gpio_{GPIO_NUM_NC};
+  std::atomic<uint32_t> raw_overflows_{0}, raw_sync_t1_{0},
+                        raw_sync_c1_{0}, raw_prefix_rejects_{0};
+  // Observability for sample-clock IRQs; these do not prove IRQ loss.
+  uint32_t raw_clock_window_count_{0};   // ISR only
+  uint32_t raw_clock_previous_cycles_{0}; // ISR only
+  uint8_t raw_clock_window_long_pending_{0};  // ISR only; exported with octet
+  std::atomic<uint32_t> raw_clock_windows_{0};
+  std::atomic<uint32_t> raw_clock_max_window_cycles_{0};
+  std::atomic<uint32_t> raw_clock_long_windows_{0};
+  std::atomic<uint32_t> raw_sync_without_preamble_{0};
+  // Sync quality and C1/A RX stages; never contains payload or meter IDs.
+  std::atomic<uint32_t> raw_t1_preamble_exact_{0}, raw_t1_preamble_near_{0},
+                        raw_t1_preamble_absent_{0};
+  std::atomic<uint32_t> raw_c1_preamble_exact_{0}, raw_c1_preamble_near_{0},
+                        raw_c1_preamble_absent_{0};
+  std::atomic<uint32_t> raw_c1_header_ok_{0}, raw_c1_header_bad_{0},
+                        raw_c1_body_complete_{0}, raw_c1_queued_{0},
+                        raw_c1_queue_dropped_{0};
+  std::atomic<uint32_t> raw_clock_min_window_cycles_{UINT32_MAX};
+  // C-mode is identified only after common 543D followed by 54CD/543D.
+  std::atomic<uint32_t> raw_common_sync_{0}, raw_c1a_second_marker_{0},
+                        raw_c1b_second_marker_{0}, raw_t1_fallback_{0},
+                        raw_stray_54cd_{0};
+  // T-only noise gate, after C-mode secondary marker was excluded.
+  std::atomic<uint32_t> raw_t1_weak_preamble_drop_{0};
+  // Diagnostic correlation: only used while main-loop RX callback is active.
+  const WmbusRxPacket *raw_t1_callback_frame_{nullptr};
+  std::atomic<uint32_t> raw_diag_t1_exact_verified_{0}, raw_diag_t1_near_verified_{0};
+  // Main-loop-only cross-tabulation of RX outcomes vs in-frame long
+  // 256-DCLK windows; a long window is not proof of IRQ loss.
+  uint32_t raw_diag_dclk_t1_verified_clean_{0}, raw_diag_dclk_t1_verified_long_{0};
+  uint32_t raw_diag_dclk_t1_bad_symbol_clean_{0}, raw_diag_dclk_t1_bad_symbol_long_{0};
+  uint32_t raw_diag_dclk_t1_other_clean_{0}, raw_diag_dclk_t1_other_long_{0};
+  uint32_t raw_diag_dclk_t1_long_windows_sum_{0};
+  std::atomic<uint32_t> raw_diag_t1_exact_bad_symbol_{0}, raw_diag_t1_near_bad_symbol_{0};
+  std::atomic<uint32_t> raw_diag_t1_exact_other_{0}, raw_diag_t1_near_other_{0};
+  std::atomic<uint32_t> raw_diag_bad_symbol_early_{0}, raw_diag_bad_symbol_middle_{0},
+                        raw_diag_bad_symbol_late_{0}, raw_diag_bad_symbol_no_invalid_{0};
+  // Main-loop-only first-invalid-symbol histogram, 1-based positions 1..32.
+  // Remaining positions retain a 33+ bucket; no meter IDs or raw bytes saved.
+  std::array<uint32_t, 32> raw_diag_first_bad_pos_1_32_{};
+  uint32_t raw_diag_first_bad_pos_33_plus_{0};
+  size_t raw_diag_first_bad_late_min_{0}, raw_diag_first_bad_late_max_{0};
+  uint64_t raw_diag_valid_symbols_before_error_sum_{0};
+  std::atomic<uint32_t> raw_diag_drop_hamming_3_5_{0}, raw_diag_drop_hamming_6_9_{0},
+                        raw_diag_drop_hamming_10_16_{0};
+  bool wmbus_c1_mode_{false};
+  bool wmbus_c1a_only_{false};
+  bool wmbus_dual_sync_{false};
+  bool wmbus_continuous_dual_{false};
+  bool wmbus_dual_c1_window_{false};  // FIFO task only
+  uint32_t wmbus_dual_window_started_ms_{0};  // FIFO task only
+  bool wmbus_lna_boost_hf_{false};
+  bool wmbus_phy_diagnostics_{false};
+  uint32_t wmbus_last_log_ms_{0};
+
+  // Boot-only hardware snapshot, safe to report on late ESPHome API reconnect.
+  // Never touch the radio SPI bus from dump_config() during active FIFO RX.
+  struct WmbusFskRegisters {
+    uint8_t rx_bw{0};
+    uint8_t afc_bw{0};
+    uint8_t rx_config{0};
+    uint8_t afc_fei{0};
+    uint8_t preamble_detect{0};
+    uint8_t sync_config{0};
+    uint8_t rssi_thresh{0};
+    bool captured{false};
+    bool matches_expected{false};
+    // Read once at boot; automatic gain can change the live LNA gain.
+    uint8_t lna{0};
+    uint8_t rssi_config{0};
+    uint8_t ook_peak{0};  // RegOokPeak[14], includes BitSyncOn bit 0x20
+    bool bitsync_readback_ok{false};
+    // Boot STANDBY, captured immediately before RX (not live packet gain).
+    uint8_t lna_standby_before{0};
+    uint8_t lna_standby_after{0};
+    bool lna_standby_captured{false};
+    bool lna_boost_readback_ok{false};
+    bool lna_gain_readback_ok{false};
+  } wmbus_fsk_registers_{};
+
+  // Atomic since the FIFO task and ESPHome main loop run independently.
+  // No meter addresses, payloads or keys are stored in these statistics.
+  struct WmbusPhyCounters {
+    std::atomic<uint32_t> rx_starts{0};
+    std::atomic<uint32_t> t1_candidates{0};
+    std::atomic<uint32_t> c1a_candidates{0};
+    std::atomic<uint32_t> c1b_candidates{0};
+    std::atomic<uint32_t> frames_queued{0};
+    std::atomic<uint32_t> t1_verified{0};
+    std::atomic<uint32_t> c1a_verified{0};
+    std::atomic<uint32_t> c1b_verified{0};
+    std::atomic<uint32_t> bad_symbols{0};
+    std::atomic<uint32_t> bad_crc{0};
+    std::atomic<uint32_t> bad_length{0};
+    std::atomic<uint32_t> bad_marker{0};
+    std::atomic<uint32_t> bad_prefix{0};
+    std::atomic<uint32_t> fifo_overruns{0};
+    std::atomic<uint32_t> frame_timeouts{0};
+    std::atomic<uint32_t> modem_timeouts{0};
+    std::atomic<uint32_t> rx_state_recoveries{0};
+    std::atomic<uint32_t> missed_irq_wakeups{0};
+    std::atomic<uint32_t> queue_drops{0};
+    std::atomic<uint32_t> rx_rearms{0};
+    // Watchdog samples, not all RF events.
+    std::atomic<uint32_t> idle_preamble_samples{0};
+    std::atomic<uint32_t> idle_sync_samples{0};
+    std::atomic<uint32_t> idle_preamble_only_samples{0};
+    std::atomic<uint32_t> rearm_total_us{0};
+    std::atomic<uint32_t> rearm_max_us{0};
+    std::atomic<uint32_t> rearm_above_1ms{0};
+    // Pre-CRC receive-stage statistics; atomic across FIFO task and main loop.
+    std::atomic<uint32_t> irq1_preamble_at_fifo{0};
+    std::atomic<uint32_t> irq1_sync_at_fifo{0};
+    std::atomic<uint32_t> fifo_marker_3d{0};
+    std::atomic<uint32_t> fifo_marker_cd{0};
+    std::atomic<uint32_t> fifo_marker_other{0};
+    std::atomic<uint32_t> fifo_marker_unreadable{0};
+    // Diagnostic only: 256 possible bytes following one-byte HW sync 0x54.
+    // FIFO task increments; ESPHome main loop reads once per minute.
+    // Never logs packets, keys or meter addresses.
+    std::array<std::atomic<uint32_t>, 256> fifo_sync54_marker_histogram{};
+    // Counts FIFO-active wakes after hardware 0x54CD sync (no marker in FIFO).
+    std::atomic<uint32_t> c1a_hw_sync_fifo{0};
+    std::atomic<uint32_t> dual_sync_switches{0};
+    std::atomic<uint32_t> c1a_bad_prefix{0};
+    std::atomic<uint32_t> c1a_body_complete{0};
+    std::atomic<uint32_t> c1a_queued{0};
+    std::atomic<uint32_t> c1a_queue_dropped{0};
+    std::atomic<uint32_t> c1a_read_aborted{0};
+  } wmbus_stats_{};
+
+  SX127xBw bandwidth_;
+  uint32_t bitrate_;
+  uint32_t deviation_;
+  uint32_t frequency_;
+  uint32_t payload_length_;
+  uint16_t preamble_size_;
+  uint8_t coding_rate_;
+  uint8_t modulation_;
+  uint8_t pa_pin_;
+  uint8_t pa_power_;
+  uint8_t pa_ramp_;
+  uint8_t preamble_detect_;
+  uint8_t preamble_errors_;
+  uint8_t preamble_polarity_;
+  uint8_t shaping_;
+  uint8_t spreading_factor_;
+  float rx_floor_;
+  bool auto_cal_{false};
+  bool bitsync_{false};
+  bool crc_enable_{false};
+  bool packet_mode_{false};
+  bool rx_start_{false};
+  bool afc_auto_{true};
+  bool agc_auto_{true};
+  uint8_t lna_gain_{1};
+};
+
+}  // namespace esphome::sx127x

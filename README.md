@@ -1,5 +1,46 @@
-# ESPHome wM-Bus XMQ standalone
+# ESPHome SX126x / SX127x wM-Bus — XMQ standalone
 
-Minimal SX126x/SX127x radio and XMQ-only decoding components. Source: verified standalone branch of `radugeo74/esphome-sx1262`.
+Minimal copy of the **functional** XMQ-only pipeline from
+[`radugeo74/esphome-sx1262`](https://github.com/radugeo74/esphome-sx1262),
+branch `experimental/xmq-standalone-no-legacy`, commit
+`d7e9fdffcbde3e51f0fa85b79b2ecc56bd597e98`.
 
-The original repository remains unchanged.
+## Included components
+
+- `components/sx126x` — Heltec native FSK T1/C1 PHY
+- `components/sx127x` — LILYGO experimental native FIFO T1/C1 PHY (hardware performance unchanged)
+- `components/wmbus_radio` — independent 3-of-6 and Format A/B CRC validation, 60-second PHY stats
+- `components/xmq_meter` — XMQ application engine and bundled XMQ driver sources, ESPHome sensor projection
+
+The bundled XMQ driver source definitions include `fhkvdataiii`, `mkradio4`,
+and `mkradio4a`. The current **production** standalone decoder selects
+`fhkvdataiii` for heat and `mkradio4` for water; `mkradio4a` is bundled
+but **not enabled** for the 12 existing meter subscriptions.
+
+**Deliberately excluded:** `wmbus_common`, legacy `wmbus_meter`, old
+`driver_*.cc`, unused experiments, old workflows, and any private meter IDs,
+keys, Wi-Fi/API/OTA credentials or actual production YAML.
+
+## ESPHome configuration
+
+```yaml
+external_components:
+  - source: github://radugeo74/esphome-sx126x-sx127x-wmbusmeters-xmq-drivers@main
+    components: [sx126x, wmbus_radio, xmq_meter]
+```
+
+For a LILYGO SX1276-only configuration, use
+`components: [sx127x, wmbus_radio, xmq_meter]` (or omit `xmq_meter` if no
+meters are configured). The actual SPI/radio settings and your private IDs and
+sensor names remain in the local device YAML. **Do not use CI test YAML on
+physical devices; credentials and IDs in it are synthetic.**
+
+## Tests and rollout
+
+Single workflow: `.github/workflows/standalone.yml` builds the 12-meter
+synthetic Heltec firmware and the SX1276 radio-only LILYGO fixture, and runs
+standalone XMQ and CRC regression tests on ESPHome 2026.11.0.
+
+The original functional firmware remains on devices until GitHub CI is green
+and the device's private YAML is switched to the new repository and validated.
+Never publish production meter addresses or credentials.

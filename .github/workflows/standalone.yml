@@ -1,0 +1,39 @@
+name: XMQ standalone — two radios
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: xmq-clean-one-check
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test standalone XMQ engine with synthetic meters
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_standalone_engine.cpp -o /tmp/xmq-engine
+          /tmp/xmq-engine
+      - name: Test independent T1/C1 PHY CRC
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic tests/test_phy_crc.cpp -o /tmp/xmq-crc
+          /tmp/xmq-crc
+      - name: Install ESPHome 2026.11.0
+        run: python -m pip install --disable-pip-version-check "esphome==2026.11.0"
+      - name: Compile Heltec SX126x with 12 synthetic XMQ sensors
+        run: esphome compile tests/heltec-xmq-12-build.yaml
+      - name: Compile LILYGO SX127x without meter sensors
+        run: esphome compile tests/lilygo-sx127x-radio-build.yaml
+      - name: Assert no legacy dependencies
+        run: |
+          set -euo pipefail
+          test ! -d components/wmbus_common
+          test ! -d components/wmbus_meter
+          ! grep -R -E '#include.*wmbus_common/|wmbus_common:' components tests
+          test -e components/xmq_meter/xmq_driver_sources.h

@@ -1,0 +1,1952 @@
+#include "sx127x.h"
+#include "wmbus_t1_length.h"
+#include "wmbus_t1_recovery_diag.h"
+#include "wmbus_fifo_guard.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#include "soc/gpio_struct.h"
+#endif
+#include "esp_cpu.h"
+
+namespace esphome::sx127x {
+
+static const char *const TAG = "sx127x";
+static const uint32_t FXOSC = 32000000u;
+static const uint16_t RAMP[16] = {3400, 2000, 1000, 500, 250, 125, 100, 62, 50, 40, 31, 25, 20, 15, 12, 10};
+static const uint32_t BW_HZ[22] = {2604,  3125,  3906,  5208,  6250,  7812,   10416,  12500,  15625,  20833,  25000,
+                                   31250, 41666, 50000, 62500, 83333, 100000, 125000, 166666, 200000, 250000, 500000};
+static const uint8_t BW_LORA[22] = {BW_7_8,   BW_7_8,   BW_7_8,   BW_7_8,   BW_7_8,   BW_7_8,  BW_10_4, BW_15_6,
+                                    BW_15_6,  BW_20_8,  BW_31_3,  BW_31_3,  BW_41_7,  BW_62_5, BW_62_5, BW_125_0,
+                                    BW_125_0, BW_125_0, BW_250_0, BW_250_0, BW_250_0, BW_500_0};
+static const uint8_t BW_FSK_OOK[22] = {RX_BW_2_6,   RX_BW_3_1,   RX_BW_3_9,   RX_BW_5_2,  RX_BW_6_3,   RX_BW_7_8,
+                                       RX_BW_10_4,  RX_BW_12_5,  RX_BW_15_6,  RX_BW_20_8, RX_BW_25_0,  RX_BW_31_3,
+                                       RX_BW_41_7,  RX_BW_50_0,  RX_BW_62_5,  RX_BW_83_3, RX_BW_100_0, RX_BW_125_0,
+                                       RX_BW_166_7, RX_BW_200_0, RX_BW_250_0, RX_BW_250_0};
+// First invalid 3-of-6 symbol (0-based), or SIZE_MAX if none found.
+// Diagnostic-only: runs on the main loop after shared PHY BAD_SYMBOL.
+// No ISR, RF gate, T1 decode or CRC behavior is altered.
+static size_t t1_first_bad_symbol_index(const uint8_t *raw, size_t bytes) {
+  if (raw == nullptr || bytes == 0) return SIZE_MAX;
+  const size_t total_symbols = bytes * 8U / 6U;
+  for (size_t pos = 0; pos < total_symbols; ++pos) {
+    uint8_t symbol = 0;
+    for (unsigned bit = 0; bit < 6U; ++bit) {
+      const size_t absolute = pos * 6U + bit;
+      symbol = static_cast<uint8_t>(
+          (symbol << 1U) | ((raw[absolute / 8U] >> (7U - (absolute % 8U))) & 1U));
+    }
+    if (t1_symbol_to_nibble(symbol) < 0) return pos;
+  }
+  return SIZE_MAX;
+}
+// Independent, diagnostic-only 3-of-6 hypothesis check for the first 1024
+// captured bits. It cannot prove a correct frame without full DLL CRC.
+static uint8_t t1_diag_valid_prefix(const uint8_t *raw, size_t bytes,
+                                     unsigned bit_shift, bool invert) {
+  const size_t available_bits = std::min<size_t>(bytes * 8U, 1024U);
+  uint8_t valid = 0;
+  for (size_t start = bit_shift; start + 6U <= available_bits; start += 6U) {
+    uint8_t symbol = 0;
+    for (unsigned i = 0; i < 6U; ++i) {
+      const size_t pos = start + i;
+      const uint8_t bit = static_cast<uint8_t>(
+          ((raw[pos / 8U] >> (7U - pos % 8U)) & 1U) ^ static_cast<unsigned>(invert));
+      symbol = static_cast<uint8_t>((symbol << 1U) | bit);
+    }
+    if (t1_symbol_to_nibble(symbol) < 0) break;
+    ++valid;
+  }
+  return valid;
+}
+static const int32_t RSSI_OFFSET_HF = 157;
+static const int32_t RSSI_OFFSET_LF = 164;
+
+uint8_t SX127x::read_register_(uint8_t reg) {
+  this->enable();
+  this->write_byte(reg & 0x7F);
+  uint8_t value = this->read_byte();
+  this->disable();
+  return value;
+}
+
+void SX127x::write_register_(uint8_t reg, uint8_t value) {
+  this->enable();
+  this->write_byte(reg | 0x80);
+  this->write_byte(value);
+  this->disable();
+}
+
+void SX127x::read_fifo_(std::vector<uint8_t> &packet) {
+  this->enable();
+  this->write_byte(REG_FIFO & 0x7F);
+  for (auto &byte : packet) {
+    byte = this->transfer_byte(0x00);
+  }
+  this->disable();
+}
+
+void SX127x::write_fifo_(const uint8_t *data, size_t len) {
+  this->enable();
+  this->write_byte(REG_FIFO | 0x80);
+  for (size_t i = 0; i < len; i++) {
+    this->transfer_byte(data[i]);
+  }
+  this->disable();
+}
+
+void IRAM_ATTR SX127x::gpio_intr(SX127x *arg) { arg->enable_loop_soon_any_context(); }
+
+void SX127x::setup() {
+  // Fail closed if the radio hardware sync width and selected link modes
+  // disagree. The C1 path must keep the byte following 0x54 in FIFO.
+  if (this->wmbus_t1_mode_) {
+    const bool sync_ok = this->wmbus_dual_sync_
+        ? this->wmbus_c1_mode_ && !this->wmbus_c1a_only_ &&
+              this->sync_value_.size() == 1 && this->sync_value_[0] == 0x54
+        : this->wmbus_c1a_only_
+        ? this->wmbus_c1_mode_ && this->sync_value_.size() == 2 &&
+              this->sync_value_[0] == 0x54 && this->sync_value_[1] == 0xCD
+        : this->wmbus_raw_dclk_
+            ? this->sync_value_.size() == 1 && this->sync_value_[0] == 0x54
+            : this->wmbus_c1_mode_
+            ? this->sync_value_.size() == 1 && this->sync_value_[0] == 0x54
+            : this->sync_value_.size() == 2 && this->sync_value_[0] == 0x54 &&
+                  this->sync_value_[1] == 0x3D;
+    if (!sync_ok) {
+      ESP_LOGE(TAG,
+               "SX127x wM-Bus sync mismatch: T1=54 3D, T1+C1=54, C1/A-only=54 CD (requires C1 bridge)");
+      this->mark_failed();
+      return;
+    }
+  }
+  // Continuous experiment: one-byte HW sync 54, with the normal preamble
+  // detector triggering AFC/AGC. The next FIFO byte distinguishes 3D (T1/C1B)
+  // from CD (C1A). No timed radio profile switching; CRC remains mandatory.
+  if (this->wmbus_continuous_dual_) {
+    if (!this->wmbus_c1_mode_ || this->wmbus_dual_sync_ ||
+        this->wmbus_c1a_only_ || this->sync_value_.size() != 1 ||
+        this->sync_value_[0] != 0x54 || this->preamble_detect_ == 0) {
+      ESP_LOGE(TAG, "SX127x continuous dual requires T1_C1, common 54 sync and hardware preamble detect");
+      this->mark_failed();
+      return;
+    }
+  }
+  // Start hybrid mode in the T1 window with a full two-byte hardware sync.
+  // A one-byte 54 sync was observed to lose most C1/A on LILYGO SX1276.
+  if (this->wmbus_dual_sync_)
+    this->sync_value_.push_back(0x3D);
+  if (this->wmbus_raw_dclk_ &&
+      (this->dio1_pin_ == nullptr ||
+       this->dio2_pin_ == nullptr || this->wmbus_continuous_dual_ ||
+       this->wmbus_dual_sync_ || this->wmbus_c1a_only_ ||
+       this->sync_value_.size() != 1 || this->sync_value_[0] != 0x54)) {
+    ESP_LOGE(TAG, "SX127x RAW DATA/DCLK requires T1 or T1_C1, DIO1 DIO2 and sync 54");
+    this->mark_failed();
+    return;
+  }
+  // setup reset
+  this->rst_pin_->setup();
+  if (this->wmbus_t1_mode_) {
+    if (this->dio1_pin_ == nullptr) {
+      ESP_LOGE(TAG, "wM-Bus T1 FIFO streaming requires DIO1");
+      this->mark_failed();
+      return;
+    }
+    this->dio1_pin_->setup();
+    if (this->wmbus_raw_dclk_) {
+      this->dio2_pin_->setup();
+      this->raw_data_gpio_ = static_cast<gpio_num_t>(this->dio2_pin_->get_pin());
+    }
+  }
+
+  // setup dio0
+  if (this->dio0_pin_) {
+    this->dio0_pin_->setup();
+    this->dio0_pin_->attach_interrupt(&SX127x::gpio_intr, this, gpio::INTERRUPT_RISING_EDGE);
+  }
+
+  // start spi
+  this->spi_setup();
+
+  // configure rf
+  this->configure();
+
+  if (this->wmbus_t1_mode_ && !this->is_failed()) {
+    // Low-priority, best-effort CRC diagnostic. Worker sees only copies.
+    // Fail-open to normal RX if optional diagnostic resources are unavailable.
+    if (this->wmbus_t1_recovery_diag_ && this->wmbus_raw_dclk_) {
+      this->t1_recovery_queue_ = xQueueCreate(2, sizeof(T1RecoveryJob));
+      if (this->t1_recovery_queue_ == nullptr ||
+          xTaskCreate(&SX127x::wmbus_recovery_task_entry_, "sx127x_t1_diag",
+                      4096, this, 1, &this->t1_recovery_task_handle_) != pdPASS) {
+        ESP_LOGW(TAG, "T1 recovery diagnostic unavailable; normal RX unaffected");
+        if (this->t1_recovery_queue_ != nullptr) {
+          vQueueDelete(this->t1_recovery_queue_);
+          this->t1_recovery_queue_ = nullptr;
+        }
+        this->wmbus_t1_recovery_diag_ = false;
+      }
+    }
+    this->wmbus_rx_queue_ = xQueueCreate(3, sizeof(WmbusRxPacket));
+    if (this->wmbus_rx_queue_ == nullptr ||
+        xTaskCreate(&SX127x::wmbus_task_entry_, "sx127x_wmbus", 6144, this, 19,
+                    &this->wmbus_task_handle_) != pdPASS) {
+      ESP_LOGE(TAG, "Cannot allocate SX127x FIFO receiver task/queue");
+      this->mark_failed();
+      return;
+    }
+    if (this->wmbus_raw_dclk_) {
+      this->dio1_pin_->attach_interrupt(&SX127x::wmbus_raw_dclk_intr_, this,
+                                        gpio::INTERRUPT_RISING_EDGE);
+      ESP_LOGW(TAG, "SX127x experimental raw DATA/DCLK active (100k IRQ/s)");
+      return;
+    }
+    // DIO1=FifoEmpty is active-low; interrupt when the first byte arrives.
+    this->dio1_pin_->attach_interrupt(&SX127x::wmbus_fifo_intr_, this,
+                                      gpio::INTERRUPT_FALLING_EDGE);
+    if (!this->dio1_pin_->digital_read())
+      xTaskNotifyGive(this->wmbus_task_handle_);
+    ESP_LOGW(TAG, "SX127x wM-Bus %s FIFO stream enabled (experimental RF)",
+             this->wmbus_continuous_dual_ ? "continuous T1/C1/A (HW sync 54, preamble trigger)" :
+             this->wmbus_dual_sync_ ? "hybrid T1/C1/A (HW sync windows 54 3D / 54 CD)" :
+             this->wmbus_c1a_only_ ? "C1/A-only (HW sync 54 CD)" :
+             this->wmbus_c1_mode_ ? "T1+C1/A+B" : "T1");
+  }
+}
+
+void SX127x::configure() {
+  // toggle chip reset
+  this->rst_pin_->digital_write(false);
+  delayMicroseconds(1000);
+  this->rst_pin_->digital_write(true);
+  delayMicroseconds(10000);
+
+  // check silicon version to make sure hw is ok
+  if (this->read_register_(REG_VERSION) != 0x12) {
+    this->mark_failed();
+    return;
+  }
+
+  // enter sleep mode
+  this->set_mode_(MOD_FSK, MODE_SLEEP);
+
+  // set freq
+  uint64_t frf = ((uint64_t) this->frequency_ << 19) / FXOSC;
+  this->write_register_(REG_FRF_MSB, (uint8_t) ((frf >> 16) & 0xFF));
+  this->write_register_(REG_FRF_MID, (uint8_t) ((frf >> 8) & 0xFF));
+  this->write_register_(REG_FRF_LSB, (uint8_t) ((frf >> 0) & 0xFF));
+
+  // enter standby mode
+  this->set_mode_(MOD_FSK, MODE_STDBY);
+
+  // run image cal
+  this->run_image_cal();
+
+  // go back to sleep
+  this->set_mode_sleep();
+
+  // config pa
+  if (this->pa_pin_ == PA_PIN_BOOST) {
+    this->pa_power_ = std::max(this->pa_power_, (uint8_t) 2);
+    this->pa_power_ = std::min(this->pa_power_, (uint8_t) 17);
+    this->write_register_(REG_PA_CONFIG, (this->pa_power_ - 2) | this->pa_pin_ | PA_MAX_POWER);
+  } else {
+    this->pa_power_ = std::min(this->pa_power_, (uint8_t) 14);
+    this->write_register_(REG_PA_CONFIG, (this->pa_power_ - 0) | this->pa_pin_ | PA_MAX_POWER);
+  }
+  if (this->modulation_ != MOD_LORA) {
+    this->write_register_(REG_PA_RAMP, this->pa_ramp_ | this->shaping_);
+  } else {
+    this->write_register_(REG_PA_RAMP, this->pa_ramp_);
+  }
+
+  // configure modem
+  if (this->modulation_ != MOD_LORA) {
+    this->configure_fsk_ook_();
+  } else {
+    this->configure_lora_();
+  }
+
+  // Native wM-Bus FSK only: capture LNA in STANDBY immediately before
+  // RX and before FIFO ISR/task creation. The default/OFF path never writes
+  // RegLna, preserving the current RF baseline.
+  if (this->wmbus_t1_mode_ && this->modulation_ == MOD_FSK && this->rx_start_) {
+    this->set_mode_standby();
+    if (this->is_failed())
+      return;
+    const uint8_t before = this->read_register_(REG_LNA);
+    uint8_t after = before;
+    if (this->wmbus_lna_boost_hf_ || !this->agc_auto_) {
+      uint8_t requested = before;
+      if (this->wmbus_lna_boost_hf_)
+        requested = sx127x_lna_with_hf_boost(requested);
+      // Manual gain is meaningful only with AGC disabled. Bits [7:5]
+      // encode G1..G6. Preserve LF boost, reserved and HF boost bits.
+      if (!this->agc_auto_)
+        requested = static_cast<uint8_t>((requested & 0x1F) | (this->lna_gain_ << 5));
+      this->write_register_(REG_LNA, requested);
+      after = this->read_register_(REG_LNA);
+    }
+    // In automatic mode gain bits can change; only verify them in manual mode.
+    const bool boost_ok = !this->wmbus_lna_boost_hf_ ||
+                          (after & LNA_BOOST_HF_MASK) == LNA_BOOST_HF_ON;
+    const bool gain_ok = this->agc_auto_ ||
+                         ((after >> 5) & 0x07) == this->lna_gain_;
+    auto &snapshot = this->wmbus_fsk_registers_;
+    snapshot.lna_standby_before = before;
+    snapshot.lna_standby_after = after;
+    snapshot.lna_standby_captured = true;
+    snapshot.lna_boost_readback_ok = boost_ok;
+    snapshot.lna_gain_readback_ok = gain_ok;
+    ESP_LOGI(TAG, "SX127x STANDBY LNA before=0x%02X after=0x%02X AGC_auto=%s manual_gain=G%u gain_readback=%s boost_requested=%s boost_readback=%s",
+             static_cast<unsigned>(before), static_cast<unsigned>(after),
+             TRUEFALSE(this->agc_auto_), static_cast<unsigned>(this->lna_gain_),
+             gain_ok ? "OK" : "MISMATCH",
+             TRUEFALSE(this->wmbus_lna_boost_hf_), boost_ok ? "OK" : "MISMATCH");
+    if (!boost_ok || !gain_ok) {
+      ESP_LOGE(TAG, "SX127x LNA gain/boost readback failed; RX not started");
+      this->mark_failed();
+      return;
+    }
+  }
+
+  // switch to rx or sleep
+  if (this->rx_start_) {
+    this->set_mode_rx();
+  } else {
+    this->set_mode_sleep();
+  }
+}
+
+void SX127x::configure_fsk_ook_() {
+  // Keep the user-selected RX bandwidth (250 kHz on the LilyGO RF baseline).
+  this->write_register_(REG_RX_BW, BW_FSK_OOK[this->bandwidth_]);
+
+  if (this->wmbus_t1_mode_) {
+    // SX1276 defaults RegAfcBw to 0x0B (50 kHz). That narrow AFC
+    // acquisition filter may miss offset wM-Bus transmitters at 100 kb/s.
+    // Adopt the 333.3-kHz AFC bandwidth used by SzczepanLeon's SX1276.
+    // Only the native wM-Bus FSK backend changes; LoRa and generic FSK
+    // retain their original register configuration.
+    this->write_register_(REG_AFC_BW, AFC_BW_333_3);
+  }
+
+  // set fdev
+  uint32_t fdev = std::min((this->deviation_ * 4096) / 250000, (uint32_t) 0x3FFF);
+  this->write_register_(REG_FDEV_MSB, (uint8_t) ((fdev >> 8) & 0xFF));
+  this->write_register_(REG_FDEV_LSB, (uint8_t) ((fdev >> 0) & 0xFF));
+
+  // set bitrate
+  uint64_t bitrate = (FXOSC + this->bitrate_ / 2) / this->bitrate_;  // round up
+  this->write_register_(REG_BITRATE_MSB, (uint8_t) ((bitrate >> 8) & 0xFF));
+  this->write_register_(REG_BITRATE_LSB, (uint8_t) ((bitrate >> 0) & 0xFF));
+
+  // configure rx and afc
+  uint8_t trigger = (this->preamble_detect_ > 0) ? TRIGGER_PREAMBLE : TRIGGER_RSSI;
+  this->write_register_(REG_AFC_FEI, AFC_AUTO_CLEAR_ON);
+  if (this->modulation_ == MOD_FSK) {
+    this->write_register_(REG_RX_CONFIG, (this->afc_auto_ ? AFC_AUTO_ON : 0) | (this->agc_auto_ ? AGC_AUTO_ON : 0) | trigger);
+  } else {
+    this->write_register_(REG_RX_CONFIG, AGC_AUTO_ON | trigger);
+  }
+
+  // Configure raw T1 FIFO streaming. PayloadLength=0 plus fixed
+  // packet format lets software drain long packets through DIO1 before
+  // the 64-byte hardware FIFO fills. The radio does not generate CRC
+  // acceptance: native wM-Bus PHY validation remains mandatory.
+  if (this->wmbus_t1_mode_ && !this->wmbus_raw_dclk_) {
+    // FIFO_LEVEL after 16 bytes. Drain 16-byte bursts with one SPI
+    // transaction each; DIO1/FifoEmpty is used only for the last <16 bytes.
+    this->write_register_(REG_FIFO_THRESH,
+                          TX_START_FIFO_EMPTY | WmbusFifoGuard::FIFO_THRESHOLD);
+    this->write_register_(REG_PACKET_CONFIG_1, FIXED_LENGTH | CRC_OFF);
+    this->write_register_(REG_PAYLOAD_LENGTH_LSB, 0);
+    this->write_register_(REG_PACKET_CONFIG_2, PACKET_MODE);
+  } else if (this->packet_mode_) {
+    uint8_t crc_mode = (this->crc_enable_) ? CRC_ON : CRC_OFF;
+    this->write_register_(REG_FIFO_THRESH, TX_START_FIFO_EMPTY);
+    if (this->payload_length_ > 0) {
+      this->write_register_(REG_PAYLOAD_LENGTH_LSB, this->payload_length_);
+      this->write_register_(REG_PACKET_CONFIG_1, crc_mode | FIXED_LENGTH);
+    } else {
+      this->write_register_(REG_PAYLOAD_LENGTH_LSB, this->get_max_packet_size() - 1);
+      this->write_register_(REG_PACKET_CONFIG_1, crc_mode | VARIABLE_LENGTH);
+    }
+    this->write_register_(REG_PACKET_CONFIG_2, PACKET_MODE);
+  } else {
+    this->write_register_(REG_PACKET_CONFIG_2, CONTINUOUS_MODE);
+  }
+  // Continuous FSK mapping: DIO1=00 (DCLK), DIO2=00 (DATA).
+  this->write_register_(REG_DIO_MAPPING1,
+                        this->wmbus_raw_dclk_ ? 0x00 :
+                        (this->wmbus_t1_mode_ ? 0x10 : DIO0_MAPPING_00));
+
+  // config bit synchronizer
+  uint8_t polarity = (this->preamble_polarity_ == 0xAA) ? PREAMBLE_AA : PREAMBLE_55;
+  if (this->wmbus_raw_dclk_) {
+    // No hardware sync gate in FSK Continuous; software searches raw DATA.
+    this->write_register_(REG_SYNC_CONFIG, AUTO_RESTART_PLL_LOCK | polarity);
+  } else if (!this->sync_value_.empty()) {
+    uint8_t size = this->sync_value_.size() - 1;
+    this->write_register_(REG_SYNC_CONFIG, AUTO_RESTART_PLL_LOCK | polarity | SYNC_ON | size);
+    for (uint32_t i = 0; i < this->sync_value_.size(); i++) {
+      this->write_register_(REG_SYNC_VALUE1 + i, this->sync_value_[i]);
+    }
+  } else {
+    this->write_register_(REG_SYNC_CONFIG, AUTO_RESTART_PLL_LOCK | polarity);
+  }
+
+  // config preamble detector
+  if (this->preamble_detect_ > 0) {
+    uint8_t size = (this->preamble_detect_ - 1) << PREAMBLE_DETECTOR_SIZE_SHIFT;
+    uint8_t tol = this->preamble_errors_ << PREAMBLE_DETECTOR_TOL_SHIFT;
+    this->write_register_(REG_PREAMBLE_DETECT, PREAMBLE_DETECTOR_ON | size | tol);
+  } else {
+    this->write_register_(REG_PREAMBLE_DETECT, PREAMBLE_DETECTOR_OFF);
+  }
+  this->write_register_(REG_PREAMBLE_SIZE_MSB, this->preamble_size_ >> 8);
+  this->write_register_(REG_PREAMBLE_SIZE_LSB, this->preamble_size_ & 0xFF);
+
+  // config sync generation and setup ook threshold
+  uint8_t bitsync = this->bitsync_ ? BIT_SYNC_ON : BIT_SYNC_OFF;
+  this->write_register_(REG_OOK_PEAK, bitsync | OOK_THRESH_STEP_0_5 | OOK_THRESH_PEAK);
+  this->write_register_(REG_OOK_AVG, OOK_AVG_RESERVED | OOK_THRESH_DEC_1_8);
+
+  // set rx floor
+  this->write_register_(REG_OOK_FIX, 256 + int(this->rx_floor_ * 2.0f));
+  this->write_register_(REG_RSSI_THRESH, std::abs(int(this->rx_floor_ * 2.0f)));
+
+  if (this->wmbus_t1_mode_) {
+    // Read back in setup, BEFORE creating the FIFO task, so register
+    // inspection cannot contend with 100-kb/s streaming SPI transactions.
+    const uint8_t rx_bw = this->read_register_(REG_RX_BW);
+    const uint8_t afc_bw = this->read_register_(REG_AFC_BW);
+    const uint8_t rx_config = this->read_register_(REG_RX_CONFIG);
+    const uint8_t afc_fei = this->read_register_(REG_AFC_FEI);
+    // Boot-only radio diagnostic; never perform extra SPI from FIFO RX.
+    const uint8_t lna = this->read_register_(REG_LNA);
+    const uint8_t rssi_config = this->read_register_(REG_RSSI_CONFIG);
+    const uint8_t preamble = this->read_register_(REG_PREAMBLE_DETECT);
+    const uint8_t sync_config = this->read_register_(REG_SYNC_CONFIG);
+    const uint8_t rssi_thresh = this->read_register_(REG_RSSI_THRESH);
+    const uint8_t ook_peak = this->read_register_(REG_OOK_PEAK);
+    const bool bitsync_readback_ok = ((ook_peak & BIT_SYNC_ON) != 0) == this->bitsync_;
+    ESP_LOGI(TAG,
+             "SX127x FSK readback: RegRxBw[12]=0x%02X RegAfcBw[13]=0x%02X RegRxConfig[0D]=0x%02X RegAfcFei[1A]=0x%02X",
+             static_cast<unsigned>(rx_bw), static_cast<unsigned>(afc_bw),
+             static_cast<unsigned>(rx_config), static_cast<unsigned>(afc_fei));
+    ESP_LOGI(TAG,
+             "SX127x FSK readback: RegPreambleDetect[1F]=0x%02X RegSyncConfig[27]=0x%02X RegRssiThresh[10]=0x%02X",
+             static_cast<unsigned>(preamble), static_cast<unsigned>(sync_config),
+             static_cast<unsigned>(rssi_thresh));
+
+    const uint8_t expected_rx_config = (this->afc_auto_ ? AFC_AUTO_ON : 0) | (this->agc_auto_ ? AGC_AUTO_ON : 0) |
+        (this->preamble_detect_ > 0 ? TRIGGER_PREAMBLE : TRIGGER_RSSI);
+    const uint8_t expected_preamble = this->preamble_detect_ > 0
+        ? PREAMBLE_DETECTOR_ON |
+              ((this->preamble_detect_ - 1) << PREAMBLE_DETECTOR_SIZE_SHIFT) |
+              (this->preamble_errors_ << PREAMBLE_DETECTOR_TOL_SHIFT)
+        : PREAMBLE_DETECTOR_OFF;
+    const uint8_t expected_sync = (this->wmbus_raw_dclk_ || this->sync_value_.empty())
+        ? static_cast<uint8_t>(AUTO_RESTART_PLL_LOCK |
+                               (this->preamble_polarity_ == 0xAA ? PREAMBLE_AA : PREAMBLE_55))
+        : static_cast<uint8_t>(AUTO_RESTART_PLL_LOCK |
+                               (this->preamble_polarity_ == 0xAA ? PREAMBLE_AA : PREAMBLE_55) |
+                               SYNC_ON | (this->sync_value_.size() - 1));
+    const bool matches_expected = rx_bw == BW_FSK_OOK[this->bandwidth_] &&
+                                  afc_bw == AFC_BW_333_3 &&
+                                  rx_config == expected_rx_config &&
+                                  (afc_fei & AFC_AUTO_CLEAR_ON) != 0 &&
+                                  preamble == expected_preamble &&
+                                  sync_config == expected_sync &&
+                                  rssi_thresh == static_cast<uint8_t>(
+                                      std::abs(int(this->rx_floor_ * 2.0f)));
+    // Store only registers already read while configuring FSK. Once RX starts,
+    // subsequent dump_config() calls must not access SPI.
+    this->wmbus_fsk_registers_ = {rx_bw, afc_bw, rx_config, afc_fei,
+                                  preamble, sync_config, rssi_thresh,
+                                  true, matches_expected, lna, rssi_config};
+    this->wmbus_fsk_registers_.ook_peak = ook_peak;
+    this->wmbus_fsk_registers_.bitsync_readback_ok = bitsync_readback_ok;
+    ESP_LOGI(TAG, "SX127x BitSync boot readback RegOokPeak[14]=0x%02X configured=%s readback=%s match=%s",
+             static_cast<unsigned>(ook_peak), TRUEFALSE(this->bitsync_),
+             TRUEFALSE((ook_peak & BIT_SYNC_ON) != 0), TRUEFALSE(bitsync_readback_ok));
+    if (!bitsync_readback_ok) ESP_LOGW(TAG, "SX127x BitSync register readback mismatch");
+    if (!matches_expected) {
+      ESP_LOGW(TAG, "SX127x FSK readback differs from YAML/expected AFC profile");
+    }
+  }
+}
+
+void SX127x::configure_lora_() {
+  // config modem
+  uint8_t header_mode = this->payload_length_ > 0 ? IMPLICIT_HEADER : EXPLICIT_HEADER;
+  uint8_t crc_mode = (this->crc_enable_) ? RX_PAYLOAD_CRC_ON : RX_PAYLOAD_CRC_OFF;
+  uint8_t spreading_factor = this->spreading_factor_ << SPREADING_FACTOR_SHIFT;
+  this->write_register_(REG_MODEM_CONFIG1, BW_LORA[this->bandwidth_] | this->coding_rate_ | header_mode);
+  this->write_register_(REG_MODEM_CONFIG2, spreading_factor | crc_mode);
+
+  // config fifo and payload length
+  this->write_register_(REG_FIFO_TX_BASE_ADDR, 0x00);
+  this->write_register_(REG_FIFO_RX_BASE_ADDR, 0x00);
+  this->write_register_(REG_PAYLOAD_LENGTH, std::max(this->payload_length_, (uint32_t) 1));
+
+  // config preamble
+  if (this->preamble_size_ >= 6) {
+    this->write_register_(REG_PREAMBLE_LEN_MSB, this->preamble_size_ >> 8);
+    this->write_register_(REG_PREAMBLE_LEN_LSB, this->preamble_size_ & 0xFF);
+  }
+
+  // optimize detection
+  float duration = 1000.0f * (1UL << this->spreading_factor_) / BW_HZ[this->bandwidth_];
+  if (duration > 16) {
+    this->write_register_(REG_MODEM_CONFIG3, MODEM_AGC_AUTO_ON | LOW_DATA_RATE_OPTIMIZE_ON);
+  } else {
+    this->write_register_(REG_MODEM_CONFIG3, MODEM_AGC_AUTO_ON);
+  }
+  if (this->spreading_factor_ == 6) {
+    this->write_register_(REG_DETECT_OPTIMIZE, 0xC5);
+    this->write_register_(REG_DETECT_THRESHOLD, 0x0C);
+  } else {
+    this->write_register_(REG_DETECT_OPTIMIZE, 0xC3);
+    this->write_register_(REG_DETECT_THRESHOLD, 0x0A);
+  }
+
+  // config sync word
+  if (!this->sync_value_.empty()) {
+    this->write_register_(REG_SYNC_WORD, this->sync_value_[0]);
+  }
+}
+
+size_t SX127x::get_max_packet_size() {
+  if (this->payload_length_ > 0) {
+    return this->payload_length_;
+  }
+  if (this->modulation_ == MOD_LORA) {
+    return SX127X_MAX_PACKET_SIZE;
+  }
+  return 64;
+}
+
+SX127xError SX127x::transmit_packet(const uint8_t *data, size_t len) {
+  if (this->payload_length_ > 0 && this->payload_length_ != len) {
+    ESP_LOGE(TAG, "Packet size does not match config");
+    return SX127xError::INVALID_PARAMS;
+  }
+  if (len == 0 || len > this->get_max_packet_size()) {
+    ESP_LOGE(TAG, "Packet size out of range");
+    return SX127xError::INVALID_PARAMS;
+  }
+
+  if (this->dio0_pin_ == nullptr) {
+    ESP_LOGE(TAG, "DIO0 pin not configured, cannot wait for transmit completion");
+    return SX127xError::INVALID_PARAMS;
+  }
+
+  SX127xError ret = SX127xError::NONE;
+  if (this->modulation_ == MOD_LORA) {
+    this->set_mode_standby();
+    if (this->payload_length_ == 0) {
+      this->write_register_(REG_PAYLOAD_LENGTH, len);
+    }
+    this->write_register_(REG_IRQ_FLAGS, 0xFF);
+    this->write_register_(REG_FIFO_ADDR_PTR, 0);
+    this->write_fifo_(data, len);
+    this->set_mode_tx();
+  } else {
+    this->set_mode_standby();
+    if (this->payload_length_ == 0) {
+      this->write_register_(REG_FIFO, len);
+    }
+    this->write_fifo_(data, len);
+    this->set_mode_tx();
+  }
+
+  // wait until transmit completes, typically the delay will be less than 100 ms
+  uint32_t start = millis();
+  while (!this->dio0_pin_->digital_read()) {
+    if (millis() - start > 4000) {
+      ESP_LOGE(TAG, "Transmit packet failure");
+      ret = SX127xError::TIMEOUT;
+      break;
+    }
+  }
+  if (this->rx_start_) {
+    this->set_mode_rx();
+  } else {
+    this->set_mode_sleep();
+  }
+  return ret;
+}
+
+void SX127x::call_listeners_(const std::vector<uint8_t> &packet, float rssi, float snr) {
+  for (auto &listener : this->listeners_) {
+    listener->on_packet(packet, rssi, snr);
+  }
+  this->packet_trigger_.trigger(packet, rssi, snr);
+}
+
+void SX127x::loop() {
+  if (this->wmbus_t1_mode_) {
+    if (this->wmbus_rx_queue_ == nullptr)
+      return;
+    WmbusRxPacket frame;
+    // Keep decoding in the ESPHome main loop, never in the high-priority
+    // FIFO reader or GPIO ISR.
+    while (xQueueReceive(this->wmbus_rx_queue_, &frame, 0) == pdTRUE) {
+      this->raw_t1_callback_frame_ =
+          (this->wmbus_raw_dclk_ && frame.t1_preamble_quality <= 1) ? &frame : nullptr;
+      if (this->wmbus_stream_callback_ != nullptr)
+        this->wmbus_stream_callback_(this->wmbus_stream_context_,
+                                     frame.bytes.data(), frame.size,
+                                     static_cast<float>(frame.rssi_half_dbm) / 2.0f);
+      this->raw_t1_callback_frame_ = nullptr;
+    }
+    if (this->wmbus_phy_diagnostics_ &&
+        static_cast<uint32_t>(millis() - this->wmbus_last_log_ms_) >= 60000U) {
+      this->wmbus_last_log_ms_ = millis();
+      this->wmbus_log_statistics_();
+    if (this->wmbus_phy_diagnostics_) {
+      const auto &s = this->wmbus_stats_;
+      const unsigned t1_ok = static_cast<unsigned>(s.t1_verified.load());
+      const unsigned t1_bad = static_cast<unsigned>(s.bad_symbols.load());
+      const unsigned total = t1_ok + t1_bad;
+      if (this->wmbus_c1_mode_) {
+        // One marker-3D candidate can be tried as T1 and C1/B.
+        // Do not report (T1+C1)/(T1 bad symbols) as a packet success rate.
+        ESP_LOGI(TAG,
+                 "SX127x FIFO %s hw_sync=%s T1_ok=%u C1A_ok=%u C1B_ok=%u "
+                 "marker_3D=%u marker_CD=%u marker_other=%u prefix_reject=%u "
+                 "bad_symbol=%u bad_crc=%u queue_drop=%u overrun=%u timeout=%u (cumulative, NOT packet delivery rate)",
+                 this->wmbus_c1a_only_ ? "C1A_ONLY" : (this->wmbus_continuous_dual_ ? "DUAL_PROBE" : "OTHER"),
+                 this->wmbus_c1a_only_ ? "54CD" : (this->wmbus_continuous_dual_ ? "54" : "other"),
+                 t1_ok, static_cast<unsigned>(s.c1a_verified.load()),
+                 static_cast<unsigned>(s.c1b_verified.load()),
+                 static_cast<unsigned>(s.fifo_marker_3d.load()),
+                 static_cast<unsigned>(s.fifo_marker_cd.load()),
+                 static_cast<unsigned>(s.fifo_marker_other.load()),
+                 static_cast<unsigned>(s.bad_prefix.load()),
+                 t1_bad, static_cast<unsigned>(s.bad_crc.load()),
+                 static_cast<unsigned>(s.queue_drops.load()),
+                 static_cast<unsigned>(s.fifo_overruns.load()),
+                 static_cast<unsigned>(s.frame_timeouts.load()));
+      } else {
+        ESP_LOGI(TAG, "SX127x T1 A/B mode=%s t1_verified=%u t1_bad_symbol=%u success_permille=%u queue_drops=%u fifo_overruns=%u (since boot, T1-only comparison)",
+                 this->wmbus_raw_dclk_ ? "RAW_DCLK" : "FIFO_SPI",
+                 t1_ok, t1_bad, total ? (t1_ok * 1000U) / total : 0U,
+                 static_cast<unsigned>(s.queue_drops.load()),
+                 static_cast<unsigned>(s.fifo_overruns.load()));
+      }
+    }
+    }
+    return;
+  }
+  this->disable_loop();
+  if (this->dio0_pin_ == nullptr || !this->dio0_pin_->digital_read()) {
+    return;
+  }
+
+  if (this->modulation_ == MOD_LORA) {
+    uint8_t status = this->read_register_(REG_IRQ_FLAGS);
+    this->write_register_(REG_IRQ_FLAGS, 0xFF);
+    if ((status & PAYLOAD_CRC_ERROR) == 0) {
+      uint8_t bytes = this->read_register_(REG_NB_RX_BYTES);
+      uint8_t addr = this->read_register_(REG_FIFO_RX_CURR_ADDR);
+      uint8_t rssi = this->read_register_(REG_PKT_RSSI_VALUE);
+      int8_t snr = (int8_t) this->read_register_(REG_PKT_SNR_VALUE);
+      this->packet_.resize(bytes);
+      this->write_register_(REG_FIFO_ADDR_PTR, addr);
+      this->read_fifo_(this->packet_);
+      if (this->frequency_ > 700000000) {
+        this->call_listeners_(this->packet_, (float) rssi - RSSI_OFFSET_HF, (float) snr / 4);
+      } else {
+        this->call_listeners_(this->packet_, (float) rssi - RSSI_OFFSET_LF, (float) snr / 4);
+      }
+    }
+  } else if (this->packet_mode_) {
+    uint8_t payload_length = this->payload_length_;
+    if (payload_length == 0) {
+      payload_length = this->read_register_(REG_FIFO);
+    }
+    this->packet_.resize(payload_length);
+    this->read_fifo_(this->packet_);
+    this->call_listeners_(this->packet_, 0.0f, 0.0f);
+  }
+}
+
+void SX127x::run_image_cal() {
+  if (this->modulation_ == MOD_LORA) {
+    this->set_mode_(MOD_FSK, MODE_SLEEP);
+    this->set_mode_(MOD_FSK, MODE_STDBY);
+  }
+  if (this->auto_cal_) {
+    this->write_register_(REG_IMAGE_CAL, IMAGE_CAL_START | AUTO_IMAGE_CAL_ON | TEMP_THRESHOLD_10C);
+  } else {
+    this->write_register_(REG_IMAGE_CAL, IMAGE_CAL_START);
+  }
+  uint32_t start = millis();
+  while (this->read_register_(REG_IMAGE_CAL) & IMAGE_CAL_RUNNING) {
+    if (millis() - start > 20) {
+      ESP_LOGE(TAG, "Image cal failure");
+      this->mark_failed();
+      break;
+    }
+  }
+  if (this->modulation_ == MOD_LORA) {
+    this->set_mode_(this->modulation_, MODE_SLEEP);
+    this->set_mode_(this->modulation_, MODE_STDBY);
+  }
+}
+
+void SX127x::set_mode_(uint8_t modulation, uint8_t mode) {
+  uint32_t start = millis();
+  this->write_register_(REG_OP_MODE, modulation | mode);
+  while (true) {
+    uint8_t curr = this->read_register_(REG_OP_MODE) & MODE_MASK;
+    if ((curr == mode) || (mode == MODE_RX && curr == MODE_RX_FS)) {
+      if (mode == MODE_SLEEP) {
+        this->write_register_(REG_OP_MODE, modulation | mode);
+      }
+      break;
+    }
+    if (millis() - start > 20) {
+      ESP_LOGE(TAG, "Set mode failure");
+      this->mark_failed();
+      return;
+    }
+  }
+}
+
+void SX127x::set_mode_rx() {
+  this->set_mode_(this->modulation_, MODE_RX);
+  if (this->modulation_ == MOD_LORA) {
+    this->write_register_(REG_IRQ_FLAGS_MASK, 0x00);
+    this->write_register_(REG_DIO_MAPPING1, DIO0_MAPPING_00);
+  }
+}
+
+void SX127x::set_mode_tx() {
+  this->set_mode_(this->modulation_, MODE_TX);
+  if (this->modulation_ == MOD_LORA) {
+    this->write_register_(REG_IRQ_FLAGS_MASK, 0x00);
+    this->write_register_(REG_DIO_MAPPING1, DIO0_MAPPING_01);
+  }
+}
+
+void SX127x::set_mode_standby() { this->set_mode_(this->modulation_, MODE_STDBY); }
+
+void SX127x::set_mode_sleep() { this->set_mode_(this->modulation_, MODE_SLEEP); }
+
+
+void SX127x::note_wmbus_decode_result(WmbusDecodeResult event) {
+  // Diagnostic correlation only; all existing PHY acceptance stays intact.
+  const auto *sample = this->raw_t1_callback_frame_;
+  if (sample != nullptr) {
+    const bool exact = sample->t1_preamble_quality == 0;
+    const bool long_window = sample->dclk_long_windows != 0;
+    this->raw_diag_dclk_t1_long_windows_sum_ += sample->dclk_long_windows;
+    if (event == WmbusDecodeResult::T1_VERIFIED) {
+      if (long_window) ++this->raw_diag_dclk_t1_verified_long_;
+      else ++this->raw_diag_dclk_t1_verified_clean_;
+      if (exact) ++this->raw_diag_t1_exact_verified_;
+      else ++this->raw_diag_t1_near_verified_;
+    } else if (event == WmbusDecodeResult::BAD_SYMBOL) {
+      if (long_window) ++this->raw_diag_dclk_t1_bad_symbol_long_;
+      else ++this->raw_diag_dclk_t1_bad_symbol_clean_;
+      if (exact) ++this->raw_diag_t1_exact_bad_symbol_;
+      else ++this->raw_diag_t1_near_bad_symbol_;
+      const size_t bad_index = t1_first_bad_symbol_index(sample->bytes.data(), sample->size);
+      if (this->wmbus_t1_recovery_diag_ && this->t1_recovery_queue_ != nullptr) {
+        if (sample->size <= 128U && sample->size >= 3U) {
+          T1RecoveryJob job{};
+          job.size = static_cast<uint16_t>(sample->size);
+          std::copy_n(sample->bytes.begin(), job.size, job.raw.begin());
+          if (xQueueSend(this->t1_recovery_queue_, &job, 0) == pdTRUE)
+            ++this->t1_recovery_submitted_;
+          else
+            ++this->t1_recovery_dropped_;
+        } else {
+          ++this->t1_recovery_skipped_;
+        }
+      }
+      if (this->wmbus_raw_diag_capture_ &&
+          this->raw_diag_samples_logged_ < RAW_DIAG_MAX_SAMPLES) {
+        // Store first, so reconnecting the ESPHome logger can replay all six.
+        // Main-loop only; no SPI, GPIO ISR work or flash writes.
+        auto &capture = this->raw_diag_captures_[this->raw_diag_samples_logged_];
+        capture.size = static_cast<uint8_t>(std::min<size_t>(sample->size, capture.data.size()));
+        capture.first_bad = bad_index == SIZE_MAX ? 0U : static_cast<uint16_t>(bad_index + 1U);
+        capture.rssi_half_dbm = sample->rssi_half_dbm;
+        capture.preamble_quality = sample->t1_preamble_quality;
+        std::copy_n(sample->bytes.begin(), capture.size, capture.data.begin());
+        // Every invalid 3-of-6 symbol is classified by minimum Hamming
+        // distance to the 16 legal codes, not just the first bad symbol.
+        const size_t total_bits = static_cast<size_t>(capture.size) * 8U;
+        for (size_t pos = 0; (pos + 1U) * 6U <= total_bits; ++pos) {
+          uint8_t symbol = 0;
+          for (unsigned bit = 0; bit < 6U; ++bit) {
+            const size_t absolute = pos * 6U + bit;
+            symbol = static_cast<uint8_t>((symbol << 1U) |
+                ((capture.data[absolute / 8U] >> (7U - (absolute % 8U))) & 1U));
+          }
+          ++capture.symbols_total;
+          if (t1_symbol_to_nibble(symbol) >= 0) continue;
+          ++capture.symbols_invalid;
+          unsigned min_distance = 6U;
+          for (unsigned legal = 0; legal < 64U; ++legal) {
+            if (t1_symbol_to_nibble(static_cast<uint8_t>(legal)) < 0) continue;
+            const unsigned distance = static_cast<unsigned>(
+                __builtin_popcount(static_cast<unsigned>(symbol ^ legal)));
+            min_distance = std::min(min_distance, distance);
+          }
+          if (min_distance == 1U) ++capture.min_distance_1;
+          else if (min_distance == 2U) ++capture.min_distance_2;
+          else ++capture.min_distance_3plus;
+        }
+        // Compare six phases after the first invalid symbol, over the
+        // same 24-symbol time window. A phase score is not CRC evidence.
+        // No phase change is ever applied to the actual receiver.
+        if (bad_index != SIZE_MAX) {
+          const size_t first_bit = bad_index * 6U;
+          if (first_bit < total_bits) {
+            capture.post_symbols = static_cast<uint8_t>(
+                std::min<size_t>(24U, (total_bits - first_bit) / 6U));
+            for (unsigned phase = 0; phase < 6U; ++phase) {
+              unsigned run = 0;
+              for (unsigned symbol_index = 0; symbol_index < capture.post_symbols; ++symbol_index) {
+                const size_t start_bit = first_bit + symbol_index * 6U + phase;
+                if (start_bit + 6U > total_bits) { run = 0; continue; }
+                uint8_t code = 0;
+                for (unsigned bit = 0; bit < 6U; ++bit) {
+                  const size_t absolute = start_bit + bit;
+                  code = static_cast<uint8_t>((code << 1U) |
+                      ((capture.data[absolute / 8U] >> (7U - absolute % 8U)) & 1U));
+                }
+                if (t1_symbol_to_nibble(code) >= 0) {
+                  ++capture.post_valid[phase];
+                  ++run;
+                  capture.post_longest_run[phase] = std::max(
+                      capture.post_longest_run[phase], static_cast<uint8_t>(run));
+                } else {
+                  run = 0;
+                }
+              }
+            }
+          }
+        }
+        ++this->raw_diag_samples_logged_;
+        // No multi-capture replay during frame reception: this previously
+        // blocked ESPHome loop for 68-95 ms on every new sample.
+        ESP_LOGI(TAG, "SX127x T1 RAW captured %u/%u first_bad=%u rssi_dbm=%.1f invalid=%u/%u (replay via dump_config)",
+                 static_cast<unsigned>(this->raw_diag_samples_logged_),
+                 static_cast<unsigned>(RAW_DIAG_MAX_SAMPLES),
+                 static_cast<unsigned>(capture.first_bad),
+                 static_cast<double>(capture.rssi_half_dbm) / 2.0,
+                 static_cast<unsigned>(capture.symbols_invalid),
+                 static_cast<unsigned>(capture.symbols_total));
+      }
+      if (bad_index == SIZE_MAX) {
+        ++this->raw_diag_bad_symbol_no_invalid_;
+      } else {
+        const size_t total_symbols = sample->size * 8U / 6U;
+        const size_t region = bad_index * 3U / total_symbols;
+        if (region == 0) ++this->raw_diag_bad_symbol_early_;
+        else if (region == 1) ++this->raw_diag_bad_symbol_middle_;
+        else ++this->raw_diag_bad_symbol_late_;
+        // Position is 1-based in logs; bad_index is also the number
+        // of valid full 3-of-6 symbols preceding this first bad symbol.
+        this->raw_diag_valid_symbols_before_error_sum_ += bad_index;
+        if (bad_index < this->raw_diag_first_bad_pos_1_32_.size()) {
+          ++this->raw_diag_first_bad_pos_1_32_[bad_index];
+        } else {
+          ++this->raw_diag_first_bad_pos_33_plus_;
+          const size_t position = bad_index + 1U;
+          if (this->raw_diag_first_bad_late_min_ == 0 || position < this->raw_diag_first_bad_late_min_)
+            this->raw_diag_first_bad_late_min_ = position;
+          if (position > this->raw_diag_first_bad_late_max_)
+            this->raw_diag_first_bad_late_max_ = position;
+        }
+      }
+    } else {
+      if (long_window) ++this->raw_diag_dclk_t1_other_long_;
+      else ++this->raw_diag_dclk_t1_other_clean_;
+      if (exact) ++this->raw_diag_t1_exact_other_;
+      else ++this->raw_diag_t1_near_other_;
+    }
+  }
+  auto &s = this->wmbus_stats_;
+  switch (event) {
+    case WmbusDecodeResult::T1_VERIFIED: ++s.t1_verified; break;
+    case WmbusDecodeResult::C1A_VERIFIED: ++s.c1a_verified; break;
+    case WmbusDecodeResult::C1B_VERIFIED: ++s.c1b_verified; break;
+    case WmbusDecodeResult::BAD_SYMBOL: ++s.bad_symbols; break;
+    case WmbusDecodeResult::BAD_CRC: ++s.bad_crc; break;
+    case WmbusDecodeResult::BAD_LENGTH: ++s.bad_length; break;
+  }
+}
+
+void SX127x::wmbus_log_statistics_() {
+  const auto &s = this->wmbus_stats_;
+  // Periodic aggregated counters only; never dump meter IDs or payloads.
+  ESP_LOGI(TAG,
+           "SX127x PHY rx_start=%u candidate T1=%u C1A=%u C1B=%u queued=%u",
+           static_cast<unsigned>(s.rx_starts.load()),
+           static_cast<unsigned>(s.t1_candidates.load()),
+           static_cast<unsigned>(s.c1a_candidates.load()),
+           static_cast<unsigned>(s.c1b_candidates.load()),
+           static_cast<unsigned>(s.frames_queued.load()));
+  ESP_LOGI(TAG,
+           "SX127x PHY verified T1=%u C1A=%u C1B=%u bad_symbol=%u bad_crc=%u bad_length=%u",
+           static_cast<unsigned>(s.t1_verified.load()),
+           static_cast<unsigned>(s.c1a_verified.load()),
+           static_cast<unsigned>(s.c1b_verified.load()),
+           static_cast<unsigned>(s.bad_symbols.load()),
+           static_cast<unsigned>(s.bad_crc.load()),
+           static_cast<unsigned>(s.bad_length.load()));
+  ESP_LOGI(TAG,
+           "SX127x PHY errors marker=%u prefix=%u overrun=%u frame_timeout=%u modem_timeout=%u rx_state=%u missed_irq=%u queue_drop=%u rearm=%u",
+           static_cast<unsigned>(s.bad_marker.load()),
+           static_cast<unsigned>(s.bad_prefix.load()),
+           static_cast<unsigned>(s.fifo_overruns.load()),
+           static_cast<unsigned>(s.frame_timeouts.load()),
+           static_cast<unsigned>(s.modem_timeouts.load()),
+           static_cast<unsigned>(s.rx_state_recoveries.load()),
+           static_cast<unsigned>(s.missed_irq_wakeups.load()),
+           static_cast<unsigned>(s.queue_drops.load()),
+           static_cast<unsigned>(s.rx_rearms.load()));
+  if (this->wmbus_raw_dclk_) {
+    ESP_LOGI(TAG, "SX127x RAW DCLK sync T1=%u C1A=%u ring_overflow=%u prefix_reject=%u sync_without_preamble=%u",
+             static_cast<unsigned>(this->raw_sync_t1_.load()),
+             static_cast<unsigned>(this->raw_sync_c1_.load()),
+             static_cast<unsigned>(this->raw_overflows_.load()),
+             static_cast<unsigned>(this->raw_prefix_rejects_.load()),
+             static_cast<unsigned>(this->raw_sync_without_preamble_.load()));
+    ESP_LOGI(TAG, "SX127x RAW DCLK preamble T1 exact=%u near2=%u absent=%u C1A exact=%u near2=%u absent=%u",
+             static_cast<unsigned>(this->raw_t1_preamble_exact_.load()),
+             static_cast<unsigned>(this->raw_t1_preamble_near_.load()),
+             static_cast<unsigned>(this->raw_t1_preamble_absent_.load()),
+             static_cast<unsigned>(this->raw_c1_preamble_exact_.load()),
+             static_cast<unsigned>(this->raw_c1_preamble_near_.load()),
+             static_cast<unsigned>(this->raw_c1_preamble_absent_.load()));
+    ESP_LOGI(TAG, "SX127x RAW sync common_543D=%u second_C1A_54CD=%u second_C1B_543D=%u fallback_T1=%u stray_54CD=%u",
+             static_cast<unsigned>(this->raw_common_sync_.load()),
+             static_cast<unsigned>(this->raw_c1a_second_marker_.load()),
+             static_cast<unsigned>(this->raw_c1b_second_marker_.load()),
+             static_cast<unsigned>(this->raw_t1_fallback_.load()),
+             static_cast<unsigned>(this->raw_stray_54cd_.load()));
+    if (this->wmbus_raw_diag_capture_) {
+      ESP_LOGI(TAG, "SX127x RAW shadow nested_543D all=%u credible_preamble_le2=%u samples=%u/%u (diagnostic only)",
+               static_cast<unsigned>(this->raw_diag_nested_sync_all_.load()),
+               static_cast<unsigned>(this->raw_diag_nested_sync_credible_.load()),
+               static_cast<unsigned>(this->raw_diag_samples_logged_),
+               static_cast<unsigned>(RAW_DIAG_MAX_SAMPLES));
+    }
+    if (this->wmbus_t1_recovery_diag_) {
+      ESP_LOGI(TAG, "SX127x T1 recovery header coherent=%u configured=%u unconfigured=%u ambiguous_or_bad=%u registered_exact=%u (NO DISPATCH)",
+               static_cast<unsigned>(this->t1_recovery_coherent_.load()),
+               static_cast<unsigned>(this->t1_recovery_configured_.load()),
+               static_cast<unsigned>(this->t1_recovery_unconfigured_.load()),
+               static_cast<unsigned>(this->t1_recovery_ambiguous_.load()),
+               static_cast<unsigned>(this->t1_recovery_meter_count_.load()));
+      ESP_LOGI(TAG, "SX127x T1 recovery diagnostic submitted=%u queue_dropped=%u crc_valid=%u crc_fail=%u skipped=%u time_budget=%u (NO DISPATCH)",
+               static_cast<unsigned>(this->t1_recovery_submitted_.load()),
+               static_cast<unsigned>(this->t1_recovery_dropped_.load()),
+               static_cast<unsigned>(this->t1_recovery_crc_valid_.load()),
+               static_cast<unsigned>(this->t1_recovery_crc_fail_.load()),
+               static_cast<unsigned>(this->t1_recovery_skipped_.load()),
+               static_cast<unsigned>(this->t1_recovery_time_budget_.load()));
+    }
+    ESP_LOGI(TAG, "SX127x RAW T1 gate weak_preamble_drop=%u (more than 2 bit errors in 16 preamble bits, C1 unchanged)",
+             static_cast<unsigned>(this->raw_t1_weak_preamble_drop_.load()));
+    ESP_LOGI(TAG, "SX127x T1 diagnostic exact verified=%u bad_symbol=%u other=%u near2 verified=%u bad_symbol=%u other=%u",
+             static_cast<unsigned>(this->raw_diag_t1_exact_verified_.load()),
+             static_cast<unsigned>(this->raw_diag_t1_exact_bad_symbol_.load()),
+             static_cast<unsigned>(this->raw_diag_t1_exact_other_.load()),
+             static_cast<unsigned>(this->raw_diag_t1_near_verified_.load()),
+             static_cast<unsigned>(this->raw_diag_t1_near_bad_symbol_.load()),
+             static_cast<unsigned>(this->raw_diag_t1_near_other_.load()));
+    ESP_LOGI(TAG, "SX127x T1 diagnostic first invalid 3of6 early=%u middle=%u late=%u none=%u (thirds of raw candidate)",
+             static_cast<unsigned>(this->raw_diag_bad_symbol_early_.load()),
+             static_cast<unsigned>(this->raw_diag_bad_symbol_middle_.load()),
+             static_cast<unsigned>(this->raw_diag_bad_symbol_late_.load()),
+             static_cast<unsigned>(this->raw_diag_bad_symbol_no_invalid_.load()));
+    // Main-loop-only statistics. Exact position distribution for symbols
+    // 1..32, plus an aggregate bucket and min/max for later errors.
+    const auto &p = this->raw_diag_first_bad_pos_1_32_;
+    ESP_LOGI(TAG, "SX127x T1 first_bad symbol positions 01-08: %u %u %u %u %u %u %u %u",
+             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    ESP_LOGI(TAG, "SX127x T1 first_bad symbol positions 09-16: %u %u %u %u %u %u %u %u",
+             p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+    ESP_LOGI(TAG, "SX127x T1 first_bad symbol positions 17-24: %u %u %u %u %u %u %u %u",
+             p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]);
+    ESP_LOGI(TAG, "SX127x T1 first_bad symbol positions 25-32: %u %u %u %u %u %u %u %u",
+             p[24], p[25], p[26], p[27], p[28], p[29], p[30], p[31]);
+    const uint32_t first4 = p[0] + p[1] + p[2] + p[3];
+    const uint32_t first8 = first4 + p[4] + p[5] + p[6] + p[7];
+    uint32_t first16 = first8;
+    uint32_t first32 = first8;
+    for (size_t k = 8; k < 32; ++k) {
+      first32 += p[k];
+      if (k < 16) first16 += p[k];
+    }
+    const uint64_t valid_before = this->raw_diag_valid_symbols_before_error_sum_;
+    const uint32_t classified = first32 + this->raw_diag_first_bad_pos_33_plus_;
+    ESP_LOGI(TAG, "SX127x T1 first_bad cumulative <=4=%u <=8=%u <=16=%u <=32=%u >32=%u none=%u; valid_symbols_before avg_x100=%u",
+             first4, first8, first16, first32,
+             this->raw_diag_first_bad_pos_33_plus_,
+             static_cast<unsigned>(this->raw_diag_bad_symbol_no_invalid_.load()),
+             classified ? static_cast<unsigned>((valid_before * 100U) / classified) : 0U);
+    ESP_LOGI(TAG, "SX127x T1 first_bad >32 position min=%u max=%u; all counters cumulative since boot",
+             static_cast<unsigned>(this->raw_diag_first_bad_late_min_),
+             static_cast<unsigned>(this->raw_diag_first_bad_late_max_));
+    ESP_LOGI(TAG, "SX127x T1 diagnostic dropped preamble Hamming 3-5=%u 6-9=%u 10-16=%u (no payload logged)",
+             static_cast<unsigned>(this->raw_diag_drop_hamming_3_5_.load()),
+             static_cast<unsigned>(this->raw_diag_drop_hamming_6_9_.load()),
+             static_cast<unsigned>(this->raw_diag_drop_hamming_10_16_.load()));
+    ESP_LOGI(TAG, "SX127x RAW C1A stages header_ok=%u header_bad=%u body_complete=%u queued=%u queue_drop=%u verified=%u (CRC failures remain in shared PHY totals)",
+             static_cast<unsigned>(this->raw_c1_header_ok_.load()),
+             static_cast<unsigned>(this->raw_c1_header_bad_.load()),
+             static_cast<unsigned>(this->raw_c1_body_complete_.load()),
+             static_cast<unsigned>(this->raw_c1_queued_.load()),
+             static_cast<unsigned>(this->raw_c1_queue_dropped_.load()),
+             static_cast<unsigned>(s.c1a_verified.load()));
+    ESP_LOGI(TAG, "SX127x T1 DCLK in-frame 256-clock windows (>1.5x nominal): verified clean=%u long=%u bad_symbol clean=%u long=%u other clean=%u long=%u long_sum=%u",
+             this->raw_diag_dclk_t1_verified_clean_, this->raw_diag_dclk_t1_verified_long_,
+             this->raw_diag_dclk_t1_bad_symbol_clean_, this->raw_diag_dclk_t1_bad_symbol_long_,
+             this->raw_diag_dclk_t1_other_clean_, this->raw_diag_dclk_t1_other_long_,
+             this->raw_diag_dclk_t1_long_windows_sum_);
+    ESP_LOGI(TAG, "SX127x RAW DCLK clock windows_256=%u long_windows=%u min_cycles=%u max_cycles=%u (NOT proof of missed IRQs)",
+             static_cast<unsigned>(this->raw_clock_windows_.load()),
+             static_cast<unsigned>(this->raw_clock_long_windows_.load()),
+             static_cast<unsigned>(this->raw_clock_min_window_cycles_.load() == UINT32_MAX ? 0 : this->raw_clock_min_window_cycles_.load()),
+             static_cast<unsigned>(this->raw_clock_max_window_cycles_.load()));
+  }
+  if (this->wmbus_phy_diagnostics_) {
+    const uint32_t n = s.rx_rearms.load();
+    ESP_LOGI(TAG, "SX127x RX stages idle_samples preamble=%u sync=%u preamble_only=%u (NOT RF frame counts)",
+             static_cast<unsigned>(s.idle_preamble_samples.load()),
+             static_cast<unsigned>(s.idle_sync_samples.load()),
+             static_cast<unsigned>(s.idle_preamble_only_samples.load()));
+    ESP_LOGI(TAG, "SX127x RX rearm n=%u total_us=%u avg_us=%u max_us=%u above_1ms=%u (command duration, NOT RF settle)",
+             static_cast<unsigned>(n), static_cast<unsigned>(s.rearm_total_us.load()),
+             static_cast<unsigned>(n ? s.rearm_total_us.load() / n : 0),
+             static_cast<unsigned>(s.rearm_max_us.load()),
+             static_cast<unsigned>(s.rearm_above_1ms.load()));
+  }
+  if (this->wmbus_c1_mode_) {
+    // HW sync 54CD consumes CD, so marker_CD remains zero for C1/A-only.
+    ESP_LOGI(TAG,
+             "SX127x SYNC54 probe irq_at_fifo preamble=%u sync=%u marker_3D=%u marker_CD=%u other=%u unreadable=%u hw_sync54CD_fifo=%u",
+             static_cast<unsigned>(s.irq1_preamble_at_fifo.load()),
+             static_cast<unsigned>(s.irq1_sync_at_fifo.load()),
+             static_cast<unsigned>(s.fifo_marker_3d.load()),
+             static_cast<unsigned>(s.fifo_marker_cd.load()),
+             static_cast<unsigned>(s.fifo_marker_other.load()),
+             static_cast<unsigned>(s.fifo_marker_unreadable.load()),
+             static_cast<unsigned>(s.c1a_hw_sync_fifo.load()));
+    if (this->wmbus_continuous_dual_) {
+      // Only once per minute, on ESPHome main-loop context. Print eight
+      // most frequent actual FIFO bytes after single-byte HW sync 0x54.
+      // This exposes possible bit-shift/polarity patterns without logging
+      // telegram contents, timing-sensitive FIFO operations or keys.
+      uint8_t top_byte[8]{};
+      uint32_t top_count[8]{};
+      uint32_t observed = 0;
+      for (unsigned b = 0; b < 256; ++b) {
+        const uint32_t count = s.fifo_sync54_marker_histogram[b].load();
+        observed += count;
+        if (count == 0)
+          continue;
+        for (unsigned slot = 0; slot < 8; ++slot) {
+          if (count > top_count[slot]) {
+            for (unsigned j = 7; j > slot; --j) {
+              top_count[j] = top_count[j - 1];
+              top_byte[j] = top_byte[j - 1];
+            }
+            top_count[slot] = count;
+            top_byte[slot] = static_cast<uint8_t>(b);
+            break;
+          }
+        }
+      }
+      ESP_LOGI(TAG, "SX127x SYNC54 marker histogram observed=%u (cumulative; top 8, 0 count means unused)",
+               static_cast<unsigned>(observed));
+      ESP_LOGI(TAG, "  markers %02X=%u %02X=%u %02X=%u %02X=%u %02X=%u %02X=%u %02X=%u %02X=%u",
+               top_byte[0], static_cast<unsigned>(top_count[0]),
+               top_byte[1], static_cast<unsigned>(top_count[1]),
+               top_byte[2], static_cast<unsigned>(top_count[2]),
+               top_byte[3], static_cast<unsigned>(top_count[3]),
+               top_byte[4], static_cast<unsigned>(top_count[4]),
+               top_byte[5], static_cast<unsigned>(top_count[5]),
+               top_byte[6], static_cast<unsigned>(top_count[6]),
+               top_byte[7], static_cast<unsigned>(top_count[7]));
+    }
+    ESP_LOGI(TAG,
+             "SX127x C1A stages marker_CD=%u hw_sync54CD_fifo=%u header_ok=%u header_bad=%u body_complete=%u queued=%u queue_drop=%u read_abort=%u crc_verified=%u",
+             static_cast<unsigned>(s.fifo_marker_cd.load()),
+             static_cast<unsigned>(s.c1a_hw_sync_fifo.load()),
+             static_cast<unsigned>(s.c1a_candidates.load()),
+             static_cast<unsigned>(s.c1a_bad_prefix.load()),
+             static_cast<unsigned>(s.c1a_body_complete.load()),
+             static_cast<unsigned>(s.c1a_queued.load()),
+             static_cast<unsigned>(s.c1a_queue_dropped.load()),
+             static_cast<unsigned>(s.c1a_read_aborted.load()),
+             static_cast<unsigned>(s.c1a_verified.load()));
+  }
+}
+
+void IRAM_ATTR SX127x::wmbus_fifo_intr_(SX127x *arg) {
+  if (arg->wmbus_task_handle_ == nullptr)
+    return;
+  BaseType_t woken = pdFALSE;
+  vTaskNotifyGiveFromISR(arg->wmbus_task_handle_, &woken);
+  if (woken == pdTRUE)
+    portYIELD_FROM_ISR();
+}
+
+
+void IRAM_ATTR SX127x::wmbus_raw_dclk_intr_(SX127x *arg) {
+  // Sample DIO2 on rising DIO1/DCLK. Constant-time ISR: no SPI or decoding.
+  // For ESP32-S3 GPIO32..GPIO48, read the hardware input latch directly.
+  // This avoids an API call at every 100-kb/s DCLK edge without changing
+  // sampling polarity, byte packing, ring buffer, or CRC verification.
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  const uint32_t pin = static_cast<uint32_t>(arg->raw_data_gpio_);
+  const uint8_t bit = pin >= 32U ? static_cast<uint8_t>((GPIO.in1.data >> (pin - 32U)) & 1U)
+                               : static_cast<uint8_t>(gpio_get_level(arg->raw_data_gpio_) != 0);
+#else
+  const uint8_t bit = gpio_get_level(arg->raw_data_gpio_) ? 1U : 0U;
+#endif
+  // Observe the time for 256 rising clocks with only one cycle-counter
+  // read per window; a long window is a hint, NOT proof of lost IRQs.
+  if (++arg->raw_clock_window_count_ == 256U) {
+    arg->raw_clock_window_count_ = 0;
+    const uint32_t now = esp_cpu_get_cycle_count();
+    const uint32_t previous = arg->raw_clock_previous_cycles_;
+    arg->raw_clock_previous_cycles_ = now;
+    if (previous != 0U) {
+      ++arg->raw_clock_windows_;
+      const uint32_t elapsed = now - previous;
+      auto &minimum = arg->raw_clock_min_window_cycles_;
+      uint32_t min_old = minimum.load(std::memory_order_relaxed);
+      while (elapsed < min_old && !minimum.compare_exchange_weak(
+          min_old, elapsed, std::memory_order_relaxed)) {}
+      auto &maximum = arg->raw_clock_max_window_cycles_;
+      uint32_t old = maximum.load(std::memory_order_relaxed);
+      while (elapsed > old && !maximum.compare_exchange_weak(
+          old, elapsed, std::memory_order_relaxed)) {}
+      // 256 clocks should take 2.56 ms at 100kb/s, 614400 CPU
+      // cycles at 240MHz. >1.5x can mean quiet RF/clock pauses.
+      if (elapsed > 921600U) {
+        ++arg->raw_clock_long_windows_;
+        arg->raw_clock_window_long_pending_ = 1U;
+      }
+    }
+  }
+  arg->raw_bit_accum_ = static_cast<uint8_t>((arg->raw_bit_accum_ << 1) | bit);
+  if (++arg->raw_bit_count_ != 8) return;
+  arg->raw_bit_count_ = 0;
+  const uint32_t head = arg->raw_head_.load(std::memory_order_relaxed);
+  const uint32_t tail = arg->raw_tail_.load(std::memory_order_acquire);
+  if (head - tail >= RAW_RING_SIZE) {
+    arg->raw_overflows_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  arg->raw_ring_[head % RAW_RING_SIZE] = arg->raw_bit_accum_;
+  arg->raw_ring_dclk_long_[head % RAW_RING_SIZE] = arg->raw_clock_window_long_pending_;
+  arg->raw_clock_window_long_pending_ = 0;
+  arg->raw_head_.store(head + 1, std::memory_order_release);
+  if (((head + 1) & 31U) == 0U && arg->wmbus_task_handle_ != nullptr) {
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(arg->wmbus_task_handle_, &woken);
+    if (woken == pdTRUE) portYIELD_FROM_ISR();
+  }
+}
+
+void SX127x::wmbus_raw_task_() {
+  // Bit-aligned software sync: accepts arbitrary byte phase from ISR packing.
+  // C-mode on air: preamble + 543D + 54CD (A) or 543D (B).
+  // The first 543D is shared with T. Inspect the NEXT 16 bits without
+  // losing them: fall back to T with the same two bytes if not a C marker.
+  // CRC remains mandatory for all candidate frames.
+  uint32_t history = 0;
+  bool collecting = false;
+  bool awaiting_second_marker = false;
+  bool c1_secondary_marker = false;
+  uint8_t marker = 0, assembled = 0, bits = 0;
+  uint8_t sync_preamble_quality = 2; // 0 exact, 1 near2, 2 absent
+  unsigned sync_preamble_errors = 0; // Hamming distance retained for T1 gate diagnostics
+  std::array<uint8_t, WMBUS_MAX_RAW_SIZE> body{};
+  size_t received = 0, target = 0;
+  WmbusRawCandidates lengths{};
+  int16_t frame_rssi = -180;
+  uint8_t candidate_long_window_count = 0;  // RAW worker only, saturating
+  while (true) {
+    const uint32_t head = this->raw_head_.load(std::memory_order_acquire);
+    const uint32_t tail = this->raw_tail_.load(std::memory_order_relaxed);
+    if (tail == head) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+      continue;
+    }
+    const uint8_t octet = this->raw_ring_[tail % RAW_RING_SIZE];
+    const uint8_t dclk_long = this->raw_ring_dclk_long_[tail % RAW_RING_SIZE];
+    this->raw_tail_.store(tail + 1, std::memory_order_release);
+    // 256-clock window must fall wholly after software sync. Require at
+    // least 34 completed body bytes; the first part remains unclassified.
+    if (collecting && received >= 34U && dclk_long != 0 &&
+        candidate_long_window_count < UINT8_MAX)
+      ++candidate_long_window_count;
+    for (int i = 7; i >= 0; --i) {
+      const uint8_t bit = static_cast<uint8_t>((octet >> i) & 1U);
+      // Shadow detector observes possible syncs while a candidate occupies
+      // the parser. It never changes parser state, acceptance or CRC rules.
+      if (this->wmbus_raw_diag_capture_ && collecting) {
+        history = (history << 1) | bit;
+        if (static_cast<uint16_t>(history) == 0x543DU) {
+          ++this->raw_diag_nested_sync_all_;
+          const uint16_t prev = static_cast<uint16_t>(history >> 16);
+          const unsigned distance = std::min(
+              static_cast<unsigned>(__builtin_popcount(static_cast<unsigned>(prev ^ 0x5555U))),
+              static_cast<unsigned>(__builtin_popcount(static_cast<unsigned>(prev ^ 0xAAAAU))));
+          if (distance <= 2U) ++this->raw_diag_nested_sync_credible_;
+        }
+      }
+      if (!collecting) {
+        history = (history << 1) | bit;
+        const uint16_t sync = static_cast<uint16_t>(history);
+        const uint16_t preceding = static_cast<uint16_t>(history >> 16);
+        if (sync == 0x54CD) {
+          // A bare 54CD is not C1/A: the 543D common sync must precede it.
+          ++this->raw_stray_54cd_;
+        } else if (sync == 0x543D) {
+          const unsigned errors_55 = static_cast<unsigned>(__builtin_popcount(
+              static_cast<unsigned>(preceding ^ 0x5555U)));
+          const unsigned errors_aa = static_cast<unsigned>(__builtin_popcount(
+              static_cast<unsigned>(preceding ^ 0xAAAAU)));
+          const unsigned errors = std::min(errors_55, errors_aa);
+          sync_preamble_errors = errors;
+          sync_preamble_quality = errors == 0 ? 0 : (errors <= 2 ? 1 : 2);
+          if (errors != 0) ++this->raw_sync_without_preamble_;
+          ++this->raw_common_sync_;
+          ++this->wmbus_stats_.rx_starts;
+          collecting = true;
+          awaiting_second_marker = true;
+          c1_secondary_marker = false;
+          marker = 0x3D; // default T-mode if next two bytes are not C marker
+          assembled = bits = 0;
+          received = target = 0;
+          candidate_long_window_count = 0;
+          lengths = {};
+          // Worker-only SPI; never read RSSI from GPIO ISR.
+          frame_rssi = -static_cast<int16_t>(this->read_register_(0x11));
+        }
+        continue;
+      }
+      assembled = static_cast<uint8_t>((assembled << 1) | bit);
+      if (++bits != 8) continue;
+      bits = 0;
+      if (received >= body.size()) {
+        collecting = false;
+        ++this->raw_prefix_rejects_;
+        history = 0;
+        continue;
+      }
+      body[received++] = assembled;
+      assembled = 0;
+      if (awaiting_second_marker && received == 2) {
+        awaiting_second_marker = false;
+        if (body[0] == 0x54 && (body[1] == 0xCD || body[1] == 0x3D)) {
+          marker = body[1];
+          c1_secondary_marker = true;
+          if (marker == 0xCD) {
+            ++this->raw_c1a_second_marker_;
+            ++this->raw_sync_c1_;
+            if (sync_preamble_quality == 0) ++this->raw_c1_preamble_exact_;
+            else if (sync_preamble_quality == 1) ++this->raw_c1_preamble_near_;
+            else ++this->raw_c1_preamble_absent_;
+          } else {
+            ++this->raw_c1b_second_marker_;
+          }
+          // The 54CD/543D secondary marker is not part of the L-field.
+          // Keep the common-sync preamble quality; the C frame starts next.
+          received = 0;
+        } else {
+          c1_secondary_marker = false;
+          ++this->raw_t1_fallback_;
+          ++this->raw_sync_t1_;
+          if (sync_preamble_quality == 0) ++this->raw_t1_preamble_exact_;
+          else if (sync_preamble_quality == 1) ++this->raw_t1_preamble_near_;
+          else ++this->raw_t1_preamble_absent_;
+          // Preserve the two original bytes verbatim for T-mode 3-of-6
+          // only if the preceding preamble is credible. The v4 capture
+          // had many spurious 543D markers without an alternating preamble
+          // which could reserve the decoder for an entire false frame.
+          // Never gate C1/A or C1/B here: their secondary marker is already
+          // handled above.
+          if (sync_preamble_quality == 2) {
+            if (sync_preamble_errors <= 5) ++this->raw_diag_drop_hamming_3_5_;
+            else if (sync_preamble_errors <= 9) ++this->raw_diag_drop_hamming_6_9_;
+            else ++this->raw_diag_drop_hamming_10_16_;
+            ++this->raw_t1_weak_preamble_drop_;
+            collecting = false;
+            history = 0;
+            continue;
+          }
+        }
+      }
+      if (received == 3) {
+        lengths = wmbus_raw_candidates(marker, this->wmbus_c1_mode_, body.data(), received, body.size());
+        // Distinguish T from C1/B even though they share 543D marker.
+        if (marker == 0x3D && !c1_secondary_marker) lengths.c1 = 0;
+        if (marker == 0x3D && c1_secondary_marker) lengths.t1 = 0;
+        // T1-only A/B comparison: never enqueue C1 candidates from RAW.
+        if (!this->wmbus_c1_mode_) lengths.c1 = 0;
+        target = std::max(lengths.t1, lengths.c1);
+        if (!target) {
+          ++this->raw_prefix_rejects_;
+          if (marker == 0xCD) ++this->raw_c1_header_bad_;
+          collecting = false;
+          history = 0;
+          continue;
+        }
+        if (lengths.t1) ++this->wmbus_stats_.t1_candidates;
+        if (lengths.c1) {
+          if (marker == 0xCD) {
+            ++this->wmbus_stats_.c1a_candidates;
+            ++this->raw_c1_header_ok_;
+          } else ++this->wmbus_stats_.c1b_candidates;
+        }
+      }
+      if (!target) continue;
+      for (unsigned choice = 0; choice < 2; ++choice) {
+        const bool c1 = choice == 1;
+        if (received != (c1 ? lengths.c1 : lengths.t1)) continue;
+        const size_t frame_size = received + (c1 ? 2 : 0);
+        if (frame_size > WMBUS_MAX_RAW_SIZE) continue;
+        WmbusRxPacket frame;
+        frame.size = static_cast<uint16_t>(frame_size);
+        frame.rssi_half_dbm = frame_rssi;
+        frame.t1_preamble_quality = c1 ? 2 : sync_preamble_quality;
+        frame.dclk_long_windows = candidate_long_window_count;
+        if (c1) {
+          frame.bytes[0] = 0x54;
+          frame.bytes[1] = marker;
+        }
+        std::copy_n(body.begin(), received, frame.bytes.begin() + (c1 ? 2 : 0));
+        // Standard wmbus_radio main loop validates CRC before meter dispatch.
+        if (c1 && marker == 0xCD) ++this->raw_c1_body_complete_;
+        if (xQueueSend(this->wmbus_rx_queue_, &frame, 0) == pdTRUE) {
+          ++this->wmbus_stats_.frames_queued;
+          if (c1 && marker == 0xCD) ++this->raw_c1_queued_;
+        } else {
+          ++this->wmbus_stats_.queue_drops;
+          if (c1 && marker == 0xCD) ++this->raw_c1_queue_dropped_;
+        }
+      }
+      if (received >= target) {
+        collecting = false;
+        history = 0;
+      }
+    }
+  }
+}
+
+void SX127x::wmbus_task_entry_(void *ctx) {
+  auto *self = static_cast<SX127x *>(ctx);
+  if (self->wmbus_raw_dclk_) self->wmbus_raw_task_();
+  else self->wmbus_task_();
+}
+
+SX127x::WmbusReadStatus SX127x::wmbus_read_fifo_(
+    uint8_t *buffer, size_t length, int64_t deadline_us) {
+  if (length == 0)
+    return WmbusReadStatus::COMPLETE;
+  if (buffer == nullptr)
+    return WmbusReadStatus::TIMEOUT;
+
+  size_t received = 0;
+  while (received < length) {
+    if (esp_timer_get_time() >= deadline_us)
+      return WmbusReadStatus::TIMEOUT;
+    const uint8_t flags = this->read_register_(WmbusFifoGuard::IRQ2_REGISTER);
+    const auto action = wmbus_fifo_next_action(flags, length - received);
+    if (action == WmbusFifoAction::OVERRUN)
+      return WmbusReadStatus::OVERRUN;
+    if (action == WmbusFifoAction::WAIT) {
+      // 1ms at 100kbps collects at most ~13 bytes; the burst path drains
+      // 16 bytes once FifoLevel is asserted, leaving ample FIFO headroom.
+      vTaskDelay(1);
+      continue;
+    }
+
+    // Keep CS asserted for one FIFO transaction. Never read 16 bytes
+    // speculatively: FifoLevel confirms they are already buffered.
+    const size_t want = action == WmbusFifoAction::BURST
+                            ? WmbusFifoGuard::FIFO_BURST
+                            : length - received;
+    size_t got = 0;
+    this->enable();
+    this->write_byte(REG_FIFO & 0x7F);
+    while (got < want) {
+      // Tails are shorter than the programmed threshold. Stop exactly
+      // when DIO1/FifoEmpty says there is no byte to read.
+      if (action == WmbusFifoAction::TAIL && this->dio1_pin_->digital_read())
+        break;
+      buffer[received + got] = this->transfer_byte(0x00);
+      ++got;
+    }
+    this->disable();
+    received += got;
+    if (got == 0)
+      vTaskDelay(1);
+  }
+
+  // The FIFO may overrun during the final burst; never submit such data.
+  return (this->read_register_(WmbusFifoGuard::IRQ2_REGISTER) &
+          WmbusFifoGuard::FIFO_OVERRUN)
+             ? WmbusReadStatus::OVERRUN : WmbusReadStatus::COMPLETE;
+}
+
+void SX127x::wmbus_restart_rx_() {
+  if (this->is_failed())
+    return;
+  ++this->wmbus_stats_.rx_rearms;
+  const int64_t rearm_started_us = this->wmbus_phy_diagnostics_ ? esp_timer_get_time() : 0;
+  // Switching to Standby, clearing FIFO/overrun, then entering RX
+  // re-arms the sync detector even after a truncated/overflowed frame.
+  this->set_mode_standby();
+  if (this->is_failed())
+    return;
+  this->write_register_(WmbusFifoGuard::IRQ2_REGISTER,
+                        WmbusFifoGuard::FIFO_OVERRUN);
+  if (this->wmbus_dual_sync_) {
+    // Only the dedicated FIFO task writes these registers, in STANDBY.
+    // Full hardware sync avoids the C1/A capture regression with sync=54.
+    this->write_register_(REG_SYNC_CONFIG,
+                          AUTO_RESTART_PLL_LOCK | PREAMBLE_55 | SYNC_ON | 1);
+    this->write_register_(REG_SYNC_VALUE1, 0x54);
+    this->write_register_(REG_SYNC_VALUE1 + 1,
+                          this->wmbus_dual_c1_window_ ? 0xCD : 0x3D);
+  }
+  this->set_mode_rx();
+  if (this->is_failed())
+    return;
+  if (this->wmbus_phy_diagnostics_) {
+    const uint32_t us = static_cast<uint32_t>(esp_timer_get_time() - rearm_started_us);
+    this->wmbus_stats_.rearm_total_us.fetch_add(us);
+    if (us > 1000) ++this->wmbus_stats_.rearm_above_1ms;
+    auto &maximum = this->wmbus_stats_.rearm_max_us;
+    uint32_t old = maximum.load();
+    while (us > old && !maximum.compare_exchange_weak(old, us)) {}
+  }
+
+  // Clear stale DIO1 notifications from the prior frame. If a fresh
+  // byte has already arrived, schedule a new read instead of losing it.
+  ulTaskNotifyTake(pdTRUE, 0);
+  if (this->wmbus_task_handle_ != nullptr &&
+      !(this->read_register_(WmbusFifoGuard::IRQ2_REGISTER) &
+        WmbusFifoGuard::FIFO_EMPTY))
+    xTaskNotifyGive(this->wmbus_task_handle_);
+}
+
+void SX127x::wmbus_task_() {
+  uint32_t last_activity_ms = millis();
+  this->wmbus_dual_window_started_ms_ = last_activity_ms;
+  while (true) {
+    const uint32_t notified = ulTaskNotifyTake(
+        pdTRUE, pdMS_TO_TICKS(this->wmbus_dual_sync_ ? 20 :
+                             WmbusFifoGuard::RX_WATCHDOG_INTERVAL_MS));
+    if (this->is_failed())
+      continue;
+
+    // Time-bounded wait also watches for a missed DIO1 falling edge,
+    // a modem no longer in RX, a hardware timeout or FIFO overrun.
+    const uint8_t flags2 = this->read_register_(WmbusFifoGuard::IRQ2_REGISTER);
+    const uint8_t flags1 = this->read_register_(WmbusFifoGuard::IRQ1_REGISTER);
+    const uint8_t mode = this->read_register_(REG_OP_MODE);
+    if (this->wmbus_phy_diagnostics_ && (flags2 & WmbusFifoGuard::FIFO_EMPTY)) {
+      // Sample already-read watchdog flags. Not a full event count.
+      const bool preamble = (flags1 & WmbusFifoGuard::IRQ1_PREAMBLE_DETECTED) != 0;
+      const bool sync = (flags1 & WmbusFifoGuard::IRQ1_SYNC_ADDRESS_MATCH) != 0;
+      if (preamble) ++this->wmbus_stats_.idle_preamble_samples;
+      if (sync) ++this->wmbus_stats_.idle_sync_samples;
+      if (preamble && !sync) ++this->wmbus_stats_.idle_preamble_only_samples;
+    }
+    const auto health = wmbus_rx_health(mode, flags1, flags2);
+    if (health != WmbusRxHealth::OK) {
+      if (health == WmbusRxHealth::FIFO_OVERRUN)
+        ++this->wmbus_stats_.fifo_overruns;
+      else if (health == WmbusRxHealth::RX_TIMEOUT)
+        ++this->wmbus_stats_.modem_timeouts;
+      else
+        ++this->wmbus_stats_.rx_state_recoveries;
+      const char *reason = health == WmbusRxHealth::FIFO_OVERRUN ? "FIFO overrun" :
+                           health == WmbusRxHealth::RX_TIMEOUT ? "modem timeout" :
+                           "unexpected RX mode";
+      ESP_LOGW(TAG, "SX127x wM-Bus recovery: %s; re-arming receiver", reason);
+      this->wmbus_restart_rx_();
+      last_activity_ms = millis();
+      continue;
+    }
+    if (this->wmbus_dual_sync_ && (flags2 & WmbusFifoGuard::FIFO_EMPTY)) {
+      // 70% T1, 30% C1/A. Switch only when the FIFO is empty.
+      // IRQ1 sync can remain latched, so it is not a reliable idle guard.
+      // This is an RF experiment, not simultaneous demodulation.
+      const uint32_t dwell_ms = this->wmbus_dual_c1_window_ ? 120 : 280;
+      if (millis() - this->wmbus_dual_window_started_ms_ >= dwell_ms) {
+        this->wmbus_dual_c1_window_ = !this->wmbus_dual_c1_window_;
+        this->wmbus_dual_window_started_ms_ = millis();
+        ++this->wmbus_stats_.dual_sync_switches;
+        this->wmbus_restart_rx_();
+        last_activity_ms = millis();
+        continue;
+      }
+    }
+    if (!notified && (flags2 & WmbusFifoGuard::FIFO_EMPTY)) {
+      // A prolonged quiet period may be a stuck RX/sync state. Re-arm
+      // occasionally without interpreting silence as a received frame.
+      if (millis() - last_activity_ms >= WmbusFifoGuard::IDLE_REARM_MS) {
+        ESP_LOGD(TAG, "SX127x wM-Bus idle watchdog re-arm");
+        this->wmbus_restart_rx_();
+        last_activity_ms = millis();
+      }
+      continue;
+    }
+    if (flags2 & WmbusFifoGuard::FIFO_EMPTY)
+      continue;  // stale notification; do not read an empty FIFO
+    if (!notified)
+      ++this->wmbus_stats_.missed_irq_wakeups;
+    ++this->wmbus_stats_.rx_starts;
+    if (this->wmbus_phy_diagnostics_ && this->wmbus_c1_mode_) {
+      // Existing IRQ1 read at task wake; sampled flags only with FIFO data.
+      // This is NOT a count of all RF preambles or missed syncs.
+      if (flags1 & WmbusFifoGuard::IRQ1_PREAMBLE_DETECTED)
+        ++this->wmbus_stats_.irq1_preamble_at_fifo;
+      if (flags1 & WmbusFifoGuard::IRQ1_SYNC_ADDRESS_MATCH)
+        ++this->wmbus_stats_.irq1_sync_at_fifo;
+    }
+    last_activity_ms = millis();
+
+    // At 100kbps a full 384-byte stream takes <31ms on-air. Every
+    // marker/prefix/body read shares one finite frame deadline.
+    const int64_t deadline_us = esp_timer_get_time() +
+                                WmbusFifoGuard::FRAME_DEADLINE_US;
+    WmbusReadStatus status = WmbusReadStatus::COMPLETE;
+    // After full HW sync=54 CD, FIFO starts with L: do NOT read a
+    // marker byte. Use synthetic 0xCD only for length/CRC reconstruction.
+    const bool hw_c1a = this->wmbus_c1a_only_ ||
+                        (this->wmbus_dual_sync_ && this->wmbus_dual_c1_window_);
+    uint8_t marker = hw_c1a ? 0xCD : 0x3D;
+    if (hw_c1a) {
+      if (this->wmbus_phy_diagnostics_)
+        ++this->wmbus_stats_.c1a_hw_sync_fifo;
+    } else if (this->wmbus_c1_mode_ && !this->wmbus_dual_sync_) {
+      // Single-byte common sync leaves marker in FIFO; the hybrid full
+      // two-byte hardware sync consumes 3D or CD before FIFO starts.
+      status = this->wmbus_read_fifo_(&marker, 1, deadline_us);
+      if (this->wmbus_phy_diagnostics_) {
+        if (status != WmbusReadStatus::COMPLETE) {
+          ++this->wmbus_stats_.fifo_marker_unreadable;
+        } else {
+          // FIFO byte immediately following hardware 0x54 sync, pre-CRC.
+          // Counter update only: no per-frame logging in the high-priority
+          // SPI reader, and no changes to marker acceptance or CRC.
+          if (this->wmbus_continuous_dual_)
+            ++this->wmbus_stats_.fifo_sync54_marker_histogram[marker];
+          switch (classify_wmbus_sync54_marker(marker)) {
+            case WmbusSync54Marker::T1_OR_C1B:
+              ++this->wmbus_stats_.fifo_marker_3d;
+              break;
+            case WmbusSync54Marker::C1A:
+              ++this->wmbus_stats_.fifo_marker_cd;
+              break;
+            case WmbusSync54Marker::OTHER:
+              ++this->wmbus_stats_.fifo_marker_other;
+              break;
+          }
+        }
+      }
+    }
+    std::array<uint8_t, WMBUS_MAX_RAW_SIZE> body{};
+    if (status == WmbusReadStatus::COMPLETE && marker != 0x3D && marker != 0xCD) {
+      ++this->wmbus_stats_.bad_marker;
+      this->wmbus_restart_rx_();
+      continue;
+    }
+    if (status == WmbusReadStatus::COMPLETE)
+      status = this->wmbus_read_fifo_(body.data(), 3, deadline_us);
+
+    if (status == WmbusReadStatus::COMPLETE) {
+      const auto candidates = wmbus_raw_candidates(
+          marker, this->wmbus_c1_mode_, body.data(), 3,
+          WMBUS_MAX_RAW_SIZE);
+      const size_t target = std::max(candidates.t1, candidates.c1);
+      if (target == 0) {
+        ++this->wmbus_stats_.bad_prefix;
+        if (this->wmbus_phy_diagnostics_ && this->wmbus_c1_mode_ && marker == 0xCD)
+          ++this->wmbus_stats_.c1a_bad_prefix;
+      } else {
+        if (candidates.t1 != 0) ++this->wmbus_stats_.t1_candidates;
+        if (candidates.c1 != 0) {
+          if (marker == 0xCD) ++this->wmbus_stats_.c1a_candidates;
+          else ++this->wmbus_stats_.c1b_candidates;
+        }
+        // Capture live signal RSSI, not the noise floor after restart.
+        const int16_t rssi = -static_cast<int16_t>(this->read_register_(0x11));
+        size_t received = 3;
+        while (received < target) {
+          // Read exactly to the next plausible T1 or C1 frame boundary.
+          // Both lengths may be candidates for the same 54 3D sync.
+          size_t boundary = target;
+          if (candidates.t1 > received)
+            boundary = std::min(boundary, candidates.t1);
+          if (candidates.c1 > received)
+            boundary = std::min(boundary, candidates.c1);
+          status = this->wmbus_read_fifo_(body.data() + received,
+                                          boundary - received, deadline_us);
+          if (status != WmbusReadStatus::COMPLETE)
+            break;
+          received = boundary;
+          for (unsigned choice = 0; choice < 2; choice++) {
+            const bool c1 = choice == 1;
+            if (received != (c1 ? candidates.c1 : candidates.t1))
+              continue;
+            const size_t total = received + (c1 ? 2 : 0);
+            if (total > WMBUS_MAX_RAW_SIZE)
+              continue;
+            WmbusRxPacket frame;
+            frame.size = static_cast<uint16_t>(total);
+            frame.rssi_half_dbm = rssi;
+            if (c1) {
+              frame.bytes[0] = 0x54;
+              frame.bytes[1] = marker;
+            }
+            std::copy_n(body.begin(), received,
+                        frame.bytes.begin() + (c1 ? 2 : 0));
+            // Only the existing wmbus_radio CRC/length checks can dispatch
+            // these candidates to configured meter subscriptions.
+            const bool c1a_probe = this->wmbus_phy_diagnostics_ &&
+                                   this->wmbus_c1_mode_ && c1 && marker == 0xCD;
+            if (c1a_probe)
+              ++this->wmbus_stats_.c1a_body_complete;
+            if (this->wmbus_rx_queue_ != nullptr) {
+              if (xQueueSend(this->wmbus_rx_queue_, &frame, 0) == pdTRUE) {
+                ++this->wmbus_stats_.frames_queued;
+                if (c1a_probe)
+                  ++this->wmbus_stats_.c1a_queued;
+              } else {
+                ++this->wmbus_stats_.queue_drops;
+                if (c1a_probe)
+                  ++this->wmbus_stats_.c1a_queue_dropped;
+                ESP_LOGW(TAG, "SX127x wM-Bus queue full; candidate discarded");
+              }
+            }
+          }
+        }
+      }
+    }
+    if (status != WmbusReadStatus::COMPLETE) {
+      if (this->wmbus_phy_diagnostics_ && this->wmbus_c1_mode_ && marker == 0xCD)
+        ++this->wmbus_stats_.c1a_read_aborted;
+      if (status == WmbusReadStatus::OVERRUN)
+        ++this->wmbus_stats_.fifo_overruns;
+      else
+        ++this->wmbus_stats_.frame_timeouts;
+      ESP_LOGW(TAG, "SX127x wM-Bus %s before frame completion; restarting RX",
+               status == WmbusReadStatus::OVERRUN ? "FIFO overrun" : "frame timeout");
+    }
+    this->wmbus_restart_rx_();
+    last_activity_ms = millis();
+  }
+}
+
+void SX127x::register_recovery_meter_id(const std::string &id) {
+  // Called by wmbus_radio when a configured meter subscribes.
+  // Reject wildcard/range expressions; only exact 8-digit BCD addresses
+  // are used by this *diagnostic*. Registration publishes an atomic count.
+  if (id.size() != 8U) return;
+  uint32_t value = 0;
+  for (char c : id) {
+    if (c < '0' || c > '9') return;
+    value = static_cast<uint32_t>((value << 4U) | (c - '0'));
+  }
+  if (value == 0U) return;
+  const unsigned n = this->t1_recovery_meter_count_.load(std::memory_order_acquire);
+  for (unsigned i = 0; i < n; ++i)
+    if (this->t1_recovery_meter_ids_[i].load(std::memory_order_relaxed) == value) return;
+  if (n >= this->t1_recovery_meter_ids_.size()) return;
+  this->t1_recovery_meter_ids_[n].store(value, std::memory_order_relaxed);
+  this->t1_recovery_meter_count_.store(n + 1U, std::memory_order_release);
+}
+
+void SX127x::wmbus_recovery_task_entry_(void *ctx) {
+  static_cast<SX127x *>(ctx)->wmbus_recovery_task_();
+}
+
+void SX127x::wmbus_recovery_task_() {
+  T1RecoveryJob job{};
+  for (;;) {
+    if (xQueueReceive(this->t1_recovery_queue_, &job, portMAX_DELAY) != pdTRUE) continue;
+    const int64_t start_us = esp_timer_get_time();
+    // Max 25 ms per frame, 5 invalid symbols, 1024 candidates.
+    // Yield to avoid monopolizing CPU; this never touches receiver state.
+    const auto result = t1_diag_try_recover(
+        job.raw.data(), job.size,
+        [start_us](unsigned trial) -> bool {
+          if ((trial & 15U) == 0U) vTaskDelay(1);
+          return esp_timer_get_time() - start_us <= 25000LL;
+        }, 5U, 1024U);
+    if (result.status == T1RecoveryStatus::CRC_VALID) {
+      ++this->t1_recovery_crc_valid_;
+      if (result.crc_valid_candidates != 1U || result.coherent_candidates != 1U ||
+          result.unique_meter_id == 0U) {
+        ++this->t1_recovery_ambiguous_;
+      } else {
+        ++this->t1_recovery_coherent_;
+        bool configured = false;
+        const unsigned n = this->t1_recovery_meter_count_.load(std::memory_order_acquire);
+        for (unsigned i = 0; i < n; ++i) {
+          if (this->t1_recovery_meter_ids_[i].load(std::memory_order_relaxed) ==
+              result.unique_meter_id) { configured = true; break; }
+        }
+        if (configured) ++this->t1_recovery_configured_;
+        else ++this->t1_recovery_unconfigured_;
+      }
+    }
+    else if (result.status == T1RecoveryStatus::CRC_FAIL)
+      ++this->t1_recovery_crc_fail_;
+    else if (result.status == T1RecoveryStatus::TIME_BUDGET)
+      ++this->t1_recovery_time_budget_;
+    else
+      ++this->t1_recovery_skipped_;
+    // Numeric summary only: never print recovered telegrams, IDs or payloads.
+    const char *classification = result.status != T1RecoveryStatus::CRC_VALID ? "not_recovered" :
+        (result.crc_valid_candidates != 1U || result.coherent_candidates != 1U ||
+         result.unique_meter_id == 0U) ? "ambiguous_or_bad_header" : "coherent";
+    ESP_LOGI(TAG, "SX127x T1 recovery diagnostic result=%u invalid=%u combinations=%u tried=%u crc_valid=%u header=%s configured=%s elapsed_ms=%u (NO DISPATCH)",
+             static_cast<unsigned>(result.status),
+             static_cast<unsigned>(result.bad_symbols),
+             static_cast<unsigned>(result.combinations),
+             static_cast<unsigned>(result.attempts),
+             static_cast<unsigned>(result.crc_valid_candidates),
+             classification,
+             result.status == T1RecoveryStatus::CRC_VALID && result.unique_meter_id != 0U &&
+             result.crc_valid_candidates == 1U && result.coherent_candidates == 1U &&
+             [&]() {
+               const unsigned n = this->t1_recovery_meter_count_.load(std::memory_order_acquire);
+               for (unsigned i = 0; i < n; ++i)
+                 if (this->t1_recovery_meter_ids_[i].load(std::memory_order_relaxed) ==
+                     result.unique_meter_id) return true;
+               return false;
+             }() ? "yes" : "no",
+             static_cast<unsigned>((esp_timer_get_time() - start_us) / 1000LL));
+  }
+}
+
+void SX127x::log_raw_diag_captures_() {
+  if (!this->wmbus_raw_diag_capture_) return;
+  // Replay on dump_config() during later ESPHome logger/API reconnections.
+  // The count and samples are main-loop owned and never written by the ISR.
+  ESP_LOGI(TAG, "SX127x T1 RAW stored captures=%u/%u (RAM only, reset on reboot)",
+           static_cast<unsigned>(this->raw_diag_samples_logged_),
+           static_cast<unsigned>(RAW_DIAG_MAX_SAMPLES));
+  static const char digits[] = "0123456789ABCDEF";
+  for (unsigned i = 0; i < this->raw_diag_samples_logged_; ++i) {
+    const auto &capture = this->raw_diag_captures_[i];
+    char hex[128U * 2U + 1U]{};
+    for (size_t b = 0; b < capture.size; ++b) {
+      hex[b * 2U] = digits[capture.data[b] >> 4U];
+      hex[b * 2U + 1U] = digits[capture.data[b] & 0x0FU];
+    }
+    ESP_LOGI(TAG, "SX127x T1 RAW stored %u/%u first_bad=%u preamble=%s rssi_dbm=%.1f raw128=%s",
+             i + 1U, static_cast<unsigned>(RAW_DIAG_MAX_SAMPLES),
+             static_cast<unsigned>(capture.first_bad),
+             capture.preamble_quality == 0 ? "exact" : "near2",
+             static_cast<double>(capture.rssi_half_dbm) / 2.0, hex);
+    uint8_t normal[6]{}, inverted[6]{};
+    for (unsigned shift = 0; shift < 6U; ++shift) {
+      normal[shift] = t1_diag_valid_prefix(capture.data.data(), capture.size, shift, false);
+      inverted[shift] = t1_diag_valid_prefix(capture.data.data(), capture.size, shift, true);
+    }
+    ESP_LOGI(TAG, "SX127x T1 RAW hypothesis stored %u valid_prefix_symbols shifts0..5 normal=%u,%u,%u,%u,%u,%u inverted=%u,%u,%u,%u,%u,%u (not CRC)",
+             i + 1U, normal[0], normal[1], normal[2], normal[3], normal[4], normal[5],
+             inverted[0], inverted[1], inverted[2], inverted[3], inverted[4], inverted[5]);
+    ESP_LOGI(TAG, "SX127x T1 RAW post-error stored %u window=%u symbols phase0..5 valid=%u,%u,%u,%u,%u,%u max_run=%u,%u,%u,%u,%u,%u (not CRC)",
+             i + 1U, static_cast<unsigned>(capture.post_symbols),
+             capture.post_valid[0], capture.post_valid[1], capture.post_valid[2],
+             capture.post_valid[3], capture.post_valid[4], capture.post_valid[5],
+             capture.post_longest_run[0], capture.post_longest_run[1], capture.post_longest_run[2],
+             capture.post_longest_run[3], capture.post_longest_run[4], capture.post_longest_run[5]);
+    ESP_LOGI(TAG, "SX127x T1 RAW Hamming stored %u symbols=%u invalid=%u min_distance_1=%u min_distance_2=%u min_distance_3plus=%u (diagnostic only)",
+             i + 1U, static_cast<unsigned>(capture.symbols_total),
+             static_cast<unsigned>(capture.symbols_invalid),
+             static_cast<unsigned>(capture.min_distance_1),
+             static_cast<unsigned>(capture.min_distance_2),
+             static_cast<unsigned>(capture.min_distance_3plus));
+  }
+}
+
+void SX127x::dump_config() {
+  ESP_LOGCONFIG(TAG, "SX127x:");
+  LOG_PIN("  CS Pin: ", this->cs_);
+  LOG_PIN("  RST Pin: ", this->rst_pin_);
+  LOG_PIN("  DIO0 Pin: ", this->dio0_pin_);
+  if (this->wmbus_t1_mode_) {
+    ESP_LOGCONFIG(TAG, "  RX path: %s (%s)",
+                  this->wmbus_raw_dclk_ ? "RAW_DCLK" : "FIFO_SPI",
+                  this->wmbus_c1_mode_ ? "T1+C1 experimental" : "T1 only");
+  }
+  if (this->wmbus_raw_dclk_) {
+    LOG_PIN("  RAW DCLK DIO1: ", this->dio1_pin_);
+    LOG_PIN("  RAW DATA DIO2: ", this->dio2_pin_);
+    ESP_LOGCONFIG(TAG, "  RAW DATA/DCLK 100 kb/s experimental: TRUE; FIFO disabled");
+    ESP_LOGCONFIG(TAG, "  RAW T1 CRC recovery diagnostic: %s (low-priority task; max 5 errors, 1024 attempts, 25 ms, NO DISPATCH)",
+                  TRUEFALSE(this->wmbus_t1_recovery_diag_));
+    ESP_LOGCONFIG(TAG, "  RAW T1 diagnostic capture: %s (max %u samples, first 128 encoded bytes; RAM replay)",
+                  TRUEFALSE(this->wmbus_raw_diag_capture_),
+                  static_cast<unsigned>(RAW_DIAG_MAX_SAMPLES));
+    if (this->wmbus_raw_diag_capture_) this->log_raw_diag_captures_();
+  }
+  const char *pa_pin = "RFO";
+  if (this->pa_pin_ == PA_PIN_BOOST) {
+    pa_pin = "BOOST";
+  }
+  ESP_LOGCONFIG(TAG,
+                "  Auto Cal: %s\n"
+                "  Frequency: %" PRIu32 " Hz\n"
+                "  Bandwidth: %" PRIu32 " Hz\n"
+                "  PA Pin: %s\n"
+                "  PA Power: %" PRIu8 " dBm\n"
+                "  PA Ramp: %" PRIu16 " us",
+                TRUEFALSE(this->auto_cal_), this->frequency_, BW_HZ[this->bandwidth_], pa_pin, this->pa_power_,
+                RAMP[this->pa_ramp_]);
+  if (this->modulation_ == MOD_FSK) {
+    ESP_LOGCONFIG(TAG, "  Deviation: %" PRIu32 " Hz", this->deviation_);
+  }
+  if (this->modulation_ == MOD_LORA) {
+    const char *cr = "4/8";
+    if (this->coding_rate_ == CODING_RATE_4_5) {
+      cr = "4/5";
+    } else if (this->coding_rate_ == CODING_RATE_4_6) {
+      cr = "4/6";
+    } else if (this->coding_rate_ == CODING_RATE_4_7) {
+      cr = "4/7";
+    }
+    ESP_LOGCONFIG(TAG,
+                  "  Modulation: LORA\n"
+                  "  Preamble Size: %" PRIu16 "\n"
+                  "  Spreading Factor: %" PRIu8 "\n"
+                  "  Coding Rate: %s\n"
+                  "  CRC Enable: %s",
+                  this->preamble_size_, this->spreading_factor_, cr, TRUEFALSE(this->crc_enable_));
+    if (this->payload_length_ > 0) {
+      ESP_LOGCONFIG(TAG, "  Payload Length: %" PRIu32, this->payload_length_);
+    }
+    if (!this->sync_value_.empty()) {
+      ESP_LOGCONFIG(TAG, "  Sync Value: 0x%02x", this->sync_value_[0]);
+    }
+  } else {
+    const char *shaping = "NONE";
+    if (this->modulation_ == MOD_FSK) {
+      if (this->shaping_ == GAUSSIAN_BT_0_3) {
+        shaping = "GAUSSIAN_BT_0_3";
+      } else if (this->shaping_ == GAUSSIAN_BT_0_5) {
+        shaping = "GAUSSIAN_BT_0_5";
+      } else if (this->shaping_ == GAUSSIAN_BT_1_0) {
+        shaping = "GAUSSIAN_BT_1_0";
+      }
+    } else {
+      if (this->shaping_ == CUTOFF_BR_X_2) {
+        shaping = "CUTOFF_BR_X_2";
+      } else if (this->shaping_ == CUTOFF_BR_X_1) {
+        shaping = "CUTOFF_BR_X_1";
+      }
+    }
+    ESP_LOGCONFIG(TAG,
+                  "  Shaping: %s\n"
+                  "  Modulation: %s\n"
+                  "  Bitrate: %" PRIu32 "b/s\n"
+                  "  Bitsync: %s\n"
+                  "  Rx Start: %s\n"
+                  "  Rx Floor: %.1f dBm\n"
+                  "  Packet Mode: %s",
+                  shaping, this->modulation_ == MOD_FSK ? LOG_STR_LITERAL("FSK") : LOG_STR_LITERAL("OOK"),
+                  this->bitrate_, TRUEFALSE(this->bitsync_), TRUEFALSE(this->rx_start_), this->rx_floor_,
+                  TRUEFALSE(this->packet_mode_));
+    if (this->packet_mode_) {
+      ESP_LOGCONFIG(TAG, "  CRC Enable: %s", TRUEFALSE(this->crc_enable_));
+    }
+    if (this->payload_length_ > 0) {
+      ESP_LOGCONFIG(TAG, "  Payload Length: %" PRIu32, this->payload_length_);
+    }
+    if (!this->sync_value_.empty()) {
+      char hex_buf[17];  // 8 bytes max = 16 hex chars + null
+      ESP_LOGCONFIG(TAG, "  Sync Value: 0x%s",
+                    format_hex_to(hex_buf, this->sync_value_.data(), this->sync_value_.size()));
+    }
+    if (this->preamble_size_ > 0 || this->preamble_detect_ > 0) {
+      ESP_LOGCONFIG(TAG,
+                    "  Preamble Polarity: 0x%X\n"
+                    "  Preamble Size: %" PRIu16 "\n"
+                    "  Preamble Detect: %" PRIu8 "\n"
+                    "  Preamble Errors: %" PRIu8,
+                    this->preamble_polarity_, this->preamble_size_, this->preamble_detect_, this->preamble_errors_);
+    }
+  }
+  if (this->wmbus_t1_mode_) {
+    ESP_LOGCONFIG(TAG, "  Continuous T1/C1/A common 54 sync (preamble gate): %s",
+                TRUEFALSE(this->wmbus_continuous_dual_));
+  ESP_LOGCONFIG(TAG, "  Hybrid T1/C1/A hardware sync windows: %s",
+                TRUEFALSE(this->wmbus_dual_sync_));
+  ESP_LOGCONFIG(TAG, "  C1/A-only hardware sync 54 CD: %s",
+                  TRUEFALSE(this->wmbus_c1a_only_));
+    ESP_LOGCONFIG(TAG, "  LNA HF boost opt-in: %s", TRUEFALSE(this->wmbus_lna_boost_hf_));
+    ESP_LOGCONFIG(TAG, "  AGC auto configured: %s; manual LNA gain (when AGC off): G%u",
+                  TRUEFALSE(this->agc_auto_), static_cast<unsigned>(this->lna_gain_));
+    // Only cached boot values. dump_config() can run after Wi-Fi/API connects,
+    // while another task is actively draining the 100-kb/s radio FIFO.
+    const auto &regs = this->wmbus_fsk_registers_;
+    if (regs.captured) {
+      ESP_LOGCONFIG(TAG, "  SX127x FSK register snapshot (captured at setup):");
+      ESP_LOGCONFIG(TAG,
+                    "    RegRxBw[12]=0x%02X RegAfcBw[13]=0x%02X RegRxConfig[0D]=0x%02X RegAfcFei[1A]=0x%02X",
+                    static_cast<unsigned>(regs.rx_bw), static_cast<unsigned>(regs.afc_bw),
+                    static_cast<unsigned>(regs.rx_config), static_cast<unsigned>(regs.afc_fei));
+      ESP_LOGCONFIG(TAG,
+                    "    RegPreambleDetect[1F]=0x%02X RegSyncConfig[27]=0x%02X RegRssiThresh[10]=0x%02X",
+                    static_cast<unsigned>(regs.preamble_detect), static_cast<unsigned>(regs.sync_config),
+                    static_cast<unsigned>(regs.rssi_thresh));
+      ESP_LOGCONFIG(TAG,
+                    "    RegLna[0C]=0x%02X RegRssiConfig[0E]=0x%02X (setup snapshot, not live gain)",
+                    static_cast<unsigned>(regs.lna), static_cast<unsigned>(regs.rssi_config));
+      if (regs.lna_standby_captured) {
+        ESP_LOGCONFIG(TAG,
+                      "    STANDBY pre-RX RegLna[0C] before=0x%02X after=0x%02X boost_readback=%s gain_readback=%s (not live gain)",
+                      static_cast<unsigned>(regs.lna_standby_before),
+                      static_cast<unsigned>(regs.lna_standby_after),
+                      regs.lna_boost_readback_ok ? "OK" : "MISMATCH",
+                      regs.lna_gain_readback_ok ? "OK" : "MISMATCH");
+      }
+      ESP_LOGCONFIG(TAG,
+                    "    FSK AGC auto: %s; AFC auto: %s; LNA HF boost: %s; RSSI smoothing: %u samples",
+                    TRUEFALSE((regs.rx_config & AGC_AUTO_ON) != 0),
+                    TRUEFALSE((regs.rx_config & AFC_AUTO_ON) != 0),
+                    TRUEFALSE((regs.lna_standby_after & LNA_BOOST_HF_MASK) == LNA_BOOST_HF_ON),
+                    static_cast<unsigned>(1U << ((regs.rssi_config & 0x07) + 1)));
+      ESP_LOGCONFIG(TAG, "    BitSync RegOokPeak[14]=0x%02X enabled=%s match_config=%s (boot readback)",
+                    static_cast<unsigned>(regs.ook_peak), TRUEFALSE((regs.ook_peak & BIT_SYNC_ON) != 0),
+                    TRUEFALSE(regs.bitsync_readback_ok));
+      ESP_LOGCONFIG(TAG, "    FSK profile matches expected: %s", TRUEFALSE(regs.matches_expected));
+    } else {
+      ESP_LOGW(TAG, "  SX127x FSK register snapshot unavailable (configuration incomplete)");
+    }
+  }
+  if (this->is_failed()) {
+    ESP_LOGE(TAG, "Configuring SX127x failed");
+  }
+}
+
+}  // namespace esphome::sx127x
