@@ -61,6 +61,6 @@ wmbus_radio:
   native_stream_mode: T1_C1
   native_phy_diagnostics: true
   frame_logging: false
-  analyzer_links: off
+  analyzer_links: "off"
   direct_xmq_only: true
 # LILYGO intentionally has no HA meter sensors.
