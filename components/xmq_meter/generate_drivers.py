@@ -100,6 +100,66 @@ def generate_driver_header(component_dir: Path) -> Path:
         "}",
         "}  // namespace xmq_runtime",
     ])
+    # Transport allowlist is independent of XMQ driver source and publication profiles.
+    # This table is not proof of authentication; it admits known clear-form envelopes only.
+    signatures = json.loads((component_dir / "transport_signatures.json").read_text(encoding="utf-8"))
+    if not isinstance(signatures, list) or not signatures or len(signatures) > 128:
+        raise ValueError("Invalid XMQ transport signature list")
+    declarations.extend([
+        "namespace xmq_runtime {",
+        "struct TransportSignature {",
+        "  const char *driver; unsigned char version, type, ci, prefix_len;",
+        "  unsigned char prefix[3];",
+        "};",
+        "inline const TransportSignature *transport_signature_catalog(std::size_t &count) {",
+        "  static const TransportSignature signatures[] = {",
+    ])
+    duplicate = set()
+    for item in signatures:
+        if not isinstance(item, dict) or set(item) != {"driver", "version", "type", "ci", "prefix"}:
+            raise ValueError("Invalid XMQ transport signature")
+        name, version, typ, ci, prefix = (
+            item["driver"], item["version"], item["type"], item["ci"], item["prefix"])
+        if not isinstance(name, str) or name not in approved:
+            raise ValueError("Unapproved transport driver")
+        if any(type(v) is not int or not (0 <= v <= 255) for v in (version, typ, ci)):
+            raise ValueError("Invalid XMQ transport byte")
+        if not isinstance(prefix, list) or not 1 <= len(prefix) <= 3 or any(
+            type(v) is not int or not (0 <= v <= 255) for v in prefix
+        ):
+            raise ValueError("Invalid XMQ transport prefix")
+        key = (name, version, typ, ci, tuple(prefix))
+        if key in duplicate:
+            raise ValueError("Duplicate XMQ transport signature")
+        duplicate.add(key)
+        padded = prefix + [0] * (3 - len(prefix))
+        declarations.append(
+            f'    {{"{name}", {version}, {typ}, {ci}, {len(prefix)}, '
+            f'{{{padded[0]}, {padded[1]}, {padded[2]}}}}},')
+    declarations.extend([
+        "  };",
+        "  count = sizeof(signatures) / sizeof(signatures[0]);",
+        "  return signatures;",
+        "}",
+        "inline const char *match_transport_signature(",
+        "    unsigned char version, unsigned char type, unsigned char ci,",
+        "    const unsigned char *application, std::size_t length) {",
+        "  if (application == nullptr) return nullptr;",
+        "  std::size_t count = 0;",
+        "  const auto *entries = transport_signature_catalog(count);",
+        "  const char *match = nullptr;",
+        "  for (std::size_t i = 0; i < count; ++i) {",
+        "    const auto &sig = entries[i];",
+        "    if (sig.version != version || sig.type != type || sig.ci != ci ||",
+        "        length < sig.prefix_len ||",
+        "        std::memcmp(application, sig.prefix, sig.prefix_len) != 0) continue;",
+        "    if (match != nullptr && std::strcmp(match, sig.driver) != 0) return nullptr;",
+        "    match = sig.driver;",
+        "  }",
+        "  return match;",
+        "}",
+        "}  // namespace xmq_runtime",
+    ])
     generated = "\n".join(declarations) + "\n"
     target = component_dir / _HEADER
     if not target.exists() or target.read_text(encoding="utf-8") != generated:

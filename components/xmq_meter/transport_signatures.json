@@ -1,0 +1,144 @@
+[
+  {
+    "driver": "fhkvdataiii",
+    "version": 105,
+    "type": 128,
+    "ci": 160,
+    "prefix": [
+      17
+    ]
+  },
+  {
+    "driver": "fhkvdataiii",
+    "version": 105,
+    "type": 128,
+    "ci": 160,
+    "prefix": [
+      15
+    ]
+  },
+  {
+    "driver": "fhkvdataiii",
+    "version": 105,
+    "type": 128,
+    "ci": 160,
+    "prefix": [
+      1
+    ]
+  },
+  {
+    "driver": "fhkvdataiii",
+    "version": 148,
+    "type": 128,
+    "ci": 160,
+    "prefix": [
+      17
+    ]
+  },
+  {
+    "driver": "fhkvdataiii",
+    "version": 148,
+    "type": 128,
+    "ci": 160,
+    "prefix": [
+      15
+    ]
+  },
+  {
+    "driver": "fhkvdataiii",
+    "version": 148,
+    "type": 128,
+    "ci": 160,
+    "prefix": [
+      1
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 149,
+    "type": 98,
+    "ci": 162,
+    "prefix": [
+      6,
+      62,
+      53
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 149,
+    "type": 98,
+    "ci": 162,
+    "prefix": [
+      6,
+      112,
+      41
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 149,
+    "type": 114,
+    "ci": 162,
+    "prefix": [
+      6,
+      62,
+      53
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 149,
+    "type": 114,
+    "ci": 162,
+    "prefix": [
+      6,
+      112,
+      41
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 112,
+    "type": 98,
+    "ci": 162,
+    "prefix": [
+      6,
+      62,
+      53
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 112,
+    "type": 98,
+    "ci": 162,
+    "prefix": [
+      6,
+      112,
+      41
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 112,
+    "type": 114,
+    "ci": 162,
+    "prefix": [
+      6,
+      62,
+      53
+    ]
+  },
+  {
+    "driver": "mkradio4",
+    "version": 112,
+    "type": 114,
+    "ci": 162,
+    "prefix": [
+      6,
+      112,
+      41
+    ]
+  }
+]

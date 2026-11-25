@@ -42,6 +42,7 @@ jobs:
               copied = Path(tmp)
               shutil.copytree(base / "drivers", copied / "drivers")
               shutil.copy2(base / "validated_profiles.json", copied / "validated_profiles.json")
+              shutil.copy2(base / "transport_signatures.json", copied / "transport_signatures.json")
               original = gen.generate_driver_header(copied).read_text()
               driver = copied / "drivers" / "mkradio4.xmq"
               driver.write_text(driver.read_text() + "\n// Driver-local update only\n")
@@ -62,6 +63,11 @@ jobs:
         run: python tests/test_new_driver_isolation.py
       - name: Test approved driver and YAML family consistency
         run: python tests/test_yaml_profile_validation.py
+      - name: Test reviewed proprietary transport signatures
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_transport_signatures.cpp -o /tmp/xmq-signatures
+          /tmp/xmq-signatures
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail

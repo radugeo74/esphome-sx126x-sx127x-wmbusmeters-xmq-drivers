@@ -20,6 +20,7 @@ with TemporaryDirectory() as directory:
     temp = Path(directory)
     shutil.copytree(COMPONENT / "drivers", temp / "drivers")
     shutil.copy2(COMPONENT / "validated_profiles.json", temp / "validated_profiles.json")
+    shutil.copy2(COMPONENT / "transport_signatures.json", temp / "transport_signatures.json")
     shutil.copy2(COMPONENT / "standalone_engine.h", temp / "standalone_engine.h")
 
     before = gen.generate_driver_header(temp).read_text(encoding="utf-8")

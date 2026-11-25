@@ -24,22 +24,17 @@ void Meter::handle_frame_(wmbus_radio::Frame *frame) {
       uint32_t(dll[7]) << 24;
   if (address != this->meter_id_) return;
   const bool water = !this->heat_;
-  if (water) {
-    if ((dll[8] != 0x95 && dll[8] != 0x70) ||
-        (dll[9] != 0x62 && dll[9] != 0x72) ||
-        dll[10] != 0xA2 || dll[11] != 0x06 ||
-        !((dll[12] == 0x3e && dll[13] == 0x35) ||
-          (dll[12] == 0x70 && dll[13] == 0x29))) {
-      ESP_LOGW(TAG, "XMQ water frame rejected: unsupported/unknown security");
-      return;
-    }
-  } else {
-    if ((dll[8] != 0x69 && dll[8] != 0x94) ||
-        dll[9] != 0x80 || dll[10] != 0xA0 ||
-        (dll[11] != 0x11 && dll[11] != 0x0f && dll[11] != 0x01)) {
-      ESP_LOGW(TAG, "XMQ heat frame rejected: unsupported/unknown security");
-      return;
-    }
+  // Only allow reviewed clear-form transport signatures generated from
+  // transport_signatures.json. These are format checks, NOT a cryptographic MAC.
+  const char *transport_driver = xmq_runtime::match_transport_signature(
+      dll[8], dll[9], dll[10], dll.data() + 11, dll.size() - 11);
+  if (transport_driver == nullptr) {
+    ESP_LOGW(TAG, "XMQ frame rejected: unapproved transport envelope");
+    return;
+  }
+  if (this->driver_ != "auto" && this->driver_ != transport_driver) {
+    ESP_LOGW(TAG, "XMQ frame rejected: selected driver/transport mismatch");
+    return;
   }
   // Exact known proprietary clear-form signatures only. They are NOT
   // cryptographic proof: these water/heat formats have no independent MAC.

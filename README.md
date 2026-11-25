@@ -128,3 +128,13 @@ When `driver:` is explicit, ESPHome validation rejects an unapproved driver or a
 mismatch between `driver` and `family` **before compilation**. `driver: auto`
 remains available; its actual selection is performed from MVT in the reviewed
 runtime registry. This check does not broaden the radio/security adaptor.
+
+### Reviewed transport signatures (experimental)
+
+The exact proprietary Techem T1 envelope allowlist lives in
+`transport_signatures.json` and is compiled into `xmq_driver_sources.h`.
+This replaces hard-coded A0/A2/version/type/application-prefix branches in
+`xmq_meter.cpp`, with equivalent approved formats. A new `.xmq` file
+alone cannot authorize a transport envelope or publication. Signatures are
+**not** cryptographic authentication; encrypted/security modes need a
+separate reviewed decrypt-and-verify path before being enabled.
