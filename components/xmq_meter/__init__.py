@@ -1,4 +1,5 @@
 """T1 proprietary XMQ primary meters; no wmbus_meter or shadow probe."""
+import json
 from pathlib import Path
 from .generate_drivers import generate_driver_header
 
@@ -23,13 +24,14 @@ CONF_RADIO_ID = "radio_id"
 CONF_METER_ID = "meter_id"
 CONF_FAMILY = "family"
 CONF_DRIVER = "driver"
+VALIDATED_DRIVERS = tuple(p["driver"] for p in json.loads((Path(__file__).resolve().parent / "validated_profiles.json").read_text(encoding="utf-8")))
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(Meter),
     cv.Required(CONF_RADIO_ID): cv.use_id(RadioComponent),
     cv.Required(CONF_METER_ID): cv.hex_int,
     cv.Required(CONF_FAMILY): cv.one_of("heat", "water", lower=True),
-    cv.Optional(CONF_DRIVER, default="auto"): cv.one_of("auto", "fhkvdataiii", "mkradio4", lower=True),
+    cv.Optional(CONF_DRIVER, default="auto"): cv.one_of("auto", *VALIDATED_DRIVERS, lower=True),
     **{cv.Optional(name): sensor.sensor_schema(accuracy_decimals=1)
        for name in FIELDS},
 }).extend(cv.COMPONENT_SCHEMA)

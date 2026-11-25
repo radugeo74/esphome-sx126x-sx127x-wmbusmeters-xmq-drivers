@@ -10,6 +10,13 @@ int main() {
   std::size_t count = 0;
   const auto *sources = xmq_runtime::driver_catalog(count);
   assert(count == 3);
+  std::size_t approved_count = 0;
+  const auto *profiles = xmq_runtime::validated_profile_catalog(approved_count);
+  assert(approved_count == 2);
+  for (std::size_t i = 0; i < approved_count; ++i) {
+    assert(xmq_runtime::source_by_name(profiles[i].name) != nullptr);
+    assert(std::string(profiles[i].name) != "mkradio4a");
+  }
   std::vector<xmq_runtime::Driver> drivers;
   for (std::size_t i = 0; i < count; ++i) {
     assert(sources[i].name != nullptr);

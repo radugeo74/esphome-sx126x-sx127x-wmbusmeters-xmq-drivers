@@ -111,3 +111,13 @@ contain additional `.xmq` definitions, but no newly imported driver is
 allowed to publish until its transport/security and output-field profile
 is reviewed and explicitly enabled in the validated registry. Existing
 `driver: fhkvdataiii` and `driver: mkradio4` remain supported.
+
+### Reviewed XMQ profiles (experimental)
+
+`validated_profiles.json` holds the reviewed driver names, meter families and
+required numeric output fields. The C++ registry is now constructed from the
+auto-generated profile catalog, not a handwritten list. Updating one .xmq
+requires no engine changes. New .xmq files appear in the source catalog but
+cannot publish without an independently reviewed profile, security envelope,
+and verified output mapping. The radio adapter still accepts only the proven
+proprietary Techem T1 envelopes.

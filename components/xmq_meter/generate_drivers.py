@@ -4,6 +4,7 @@ Source of truth: drivers/<name>.xmq. Never edit generated header.
 The generator runs during ESPHome component loading and in CI host tests.
 """
 from pathlib import Path
+import json
 import re
 
 _FILENAME = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -65,6 +66,35 @@ def generate_driver_header(component_dir: Path) -> Path:
         "  for (std::size_t i = 0; i < count; ++i)",
         "    if (std::strcmp(name, entries[i].name) == 0) return entries[i].source;",
         "  return nullptr;",
+        "}",
+        "struct DriverProfile { const char *name; const char *family; const char *required_numeric; };",
+        "}  // namespace xmq_runtime",
+    ])
+    profiles = json.loads((component_dir / "validated_profiles.json").read_text(encoding="utf-8"))
+    if not isinstance(profiles, list) or not (1 <= len(profiles) <= 32):
+        raise ValueError("Invalid validated XMQ profiles")
+    approved = set()
+    declarations.extend([
+        "namespace xmq_runtime {",
+        "inline const DriverProfile *validated_profile_catalog(std::size_t &count) {",
+        "  static const DriverProfile profiles[] = {",
+    ])
+    for profile in profiles:
+        if not isinstance(profile, dict) or set(profile) != {"driver", "family", "required_numeric"}:
+            raise ValueError("Invalid validated profile")
+        name, family, fields = profile["driver"], profile["family"], profile["required_numeric"]
+        if not isinstance(name, str) or name not in seen or name in approved:
+            raise ValueError("Approved driver missing/duplicated")
+        if family not in ("heat", "water") or not isinstance(fields, list) or not 1 <= len(fields) <= 16:
+            raise ValueError("Invalid approved family/fields")
+        if any(not isinstance(x, str) or not _FILENAME.fullmatch(x) for x in fields) or len(set(fields)) != len(fields):
+            raise ValueError("Invalid approved numeric fields")
+        approved.add(name)
+        declarations.append(f'    {{"{name}", "{family}", "{",".join(fields)}"}},')
+    declarations.extend([
+        "  };",
+        "  count = sizeof(profiles) / sizeof(profiles[0]);",
+        "  return profiles;",
         "}",
         "}  // namespace xmq_runtime",
     ])
