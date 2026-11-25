@@ -255,3 +255,14 @@ before the XMQ engine. Host checks also cover empty/oversize applications
 and require stale output to be cleared on failure. Standard DV decoding
 remains available in the independent XMQ engine for future explicitly
 reviewed transports; no encrypted support is enabled.
+
+### mkradio4a candidate integration (CI 0x72, no key)
+
+`mkradio4a_candidate.h` now connects the full upstream CI 0x72 envelope,
+validated **inner** BCD meter identity, independent StandardDv XMQ driver,
+and primary-readiness gate. Acceptance requires both `target_m3` and a
+valid calendar `target_date` before a result can leave the candidate.
+Host regressions check both original warm/cold specimens, wrong inner ID,
+missing volume/date, invalid date and stale-output clearing. The
+candidate does not register mkradio4a for live sensors and does not decode
+the encrypted manufacturer-specific tail. No new real meter keys are needed.
