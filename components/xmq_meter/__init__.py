@@ -1,4 +1,9 @@
 """T1 proprietary XMQ primary meters; no wmbus_meter or shadow probe."""
+from pathlib import Path
+from .generate_drivers import generate_driver_header
+
+# Generate before ESPHome resource discovery copies *.h sources to build dir.
+generate_driver_header(Path(__file__).resolve().parent)
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import sensor
@@ -29,6 +34,8 @@ CONFIG_SCHEMA = cv.Schema({
 
 
 async def to_code(config):
+    # Regenerate if a single .xmq source was updated in the component cache.
+    generate_driver_header(Path(__file__).resolve().parent)
     add_idf_sdkconfig_option("CONFIG_COMPILER_CXX_EXCEPTIONS", True)
     cg.add_build_flag("-DXMQ_STANDALONE_ONLY=1")
     var = cg.new_Pvariable(config[CONF_ID])

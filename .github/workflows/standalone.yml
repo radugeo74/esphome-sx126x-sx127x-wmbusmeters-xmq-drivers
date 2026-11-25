@@ -14,11 +14,42 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - name: Generate C++ driver header from independent XMQ sources
+        run: python components/xmq_meter/generate_drivers.py
       - name: Test standalone XMQ engine with synthetic meters
         run: |
           set -euo pipefail
           g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_standalone_engine.cpp -o /tmp/xmq-engine
           /tmp/xmq-engine
+      - name: Verify replacing one .xmq driver changes only its generated function
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          import shutil
+          base = Path("components/xmq_meter")
+          spec = importlib.util.spec_from_file_location("gen", base / "generate_drivers.py")
+          gen = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gen)
+          with TemporaryDirectory() as tmp:
+              copied = Path(tmp)
+              shutil.copytree(base / "drivers", copied / "drivers")
+              original = gen.generate_driver_header(copied).read_text()
+              driver = copied / "drivers" / "mkradio4.xmq"
+              driver.write_text(driver.read_text() + "\\n// Driver-local update only\\n")
+              modified = gen.generate_driver_header(copied).read_text()
+              assert modified != original
+              for name in ("fhkvdataiii", "mkradio4a"):
+                  def func(text, name):
+                      start = text.index("inline const char *source_" + name + "()")
+                      end = text.index("\\n}", start) + 2
+                      return text[start:end]
+                  assert func(original, name) == func(modified, name)
+              assert func(original, "mkradio4") != func(modified, "mkradio4")
+              print("INDEPENDENT_XMQ_DRIVER_REPLACEMENT_OK")
+          PY
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail
@@ -36,4 +67,8 @@ jobs:
           test ! -d components/wmbus_common
           test ! -d components/wmbus_meter
           ! grep -R -E '#include.*wmbus_common/|wmbus_common:' components tests
+          test -e components/xmq_meter/drivers/fhkvdataiii.xmq
+          test -e components/xmq_meter/drivers/mkradio4.xmq
+          test -e components/xmq_meter/drivers/mkradio4a.xmq
+          python components/xmq_meter/generate_drivers.py
           test -e components/xmq_meter/xmq_driver_sources.h

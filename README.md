@@ -44,3 +44,24 @@ standalone XMQ and CRC regression tests on ESPHome 2026.11.0.
 The original functional firmware remains on devices until GitHub CI is green
 and the device's private YAML is switched to the new repository and validated.
 Never publish production meter addresses or credentials.
+
+## Driver files — independent XMQ sources
+
+**Source of truth:** `components/xmq_meter/drivers/<driver>.xmq`.
+Every driver is individually editable/replacable. Existing examples:
+
+- `fhkvdataiii.xmq` — current heat profile
+- `mkradio4.xmq` — current water profile
+- `mkradio4a.xmq` — available source, not active in current firmware
+
+`components/xmq_meter/generate_drivers.py` generates
+`xmq_driver_sources.h` from `drivers/*.xmq` during ESPHome component loading.
+The generated header is **not committed**. Do not edit it. The engine's
+existing driver-loading API remains unchanged; no legacy driver copies.
+The generator validates that the file basename matches the driver `name`.
+Adding an arbitrary new file makes its `source_<name>()` available, but
+**does not automatically add meter-family routing or publish new fields**:
+those are separate configuration/engine changes when needed.
+
+Workflow validates independent replacement of a single driver without
+changing the generated function bodies of other drivers.
