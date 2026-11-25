@@ -1,0 +1,14 @@
+{
+  "source": "synthetic",
+  "link_mode": "T1",
+  "manufacturer": "TST",
+  "version": 1,
+  "device_type": 2,
+  "ci": 122,
+  "access_number": 7,
+  "security_configuration_hex": "0000",
+  "ciphertext_hex": "00112233445566778899aabbccddeeff",
+  "iv_derivation": "unknown",
+  "integrity_evidence": "not_verified",
+  "key_reference": "not_in_repository"
+}
