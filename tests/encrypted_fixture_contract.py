@@ -6,13 +6,14 @@ cannot authorize publication of an encrypted payload.
 import json
 from pathlib import Path
 import re
+from urllib.parse import urlsplit
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _MFCT = re.compile(r"^[A-Z]{3}$")
 _ALLOWED = {
     "source", "link_mode", "manufacturer", "version", "device_type",
     "ci", "access_number", "security_configuration_hex", "ciphertext_hex",
-    "iv_derivation", "integrity_evidence", "key_reference",
+    "iv_derivation", "integrity_evidence", "key_reference", "reference_url",
 }
 _FORBIDDEN = {"key", "aes_key", "secret", "password", "key_hex",
               "plaintext", "decrypted_payload", "private_key"}
@@ -25,6 +26,17 @@ def validate_pending_fixture(fixture):
         raise ValueError("Encrypted fixtures must not contain secrets")
     if fixture["source"] not in ("synthetic", "public_reference"):
         raise ValueError("Unsupported fixture source")
+    reference = fixture["reference_url"]
+    if fixture["source"] == "synthetic":
+        if reference is not None:
+            raise ValueError("Synthetic fixture must not claim external provenance")
+    else:
+        if not isinstance(reference, str) or len(reference) > 512:
+            raise ValueError("Public fixture needs a documented HTTPS source")
+        parts = urlsplit(reference)
+        if (parts.scheme != "https" or not parts.hostname or parts.username or
+                parts.password or parts.query or parts.fragment or "@" in parts.netloc):
+            raise ValueError("Invalid public reference provenance URL")
     if fixture["link_mode"] not in ("T1", "C1"):
         raise ValueError("Unsupported link mode")
     if not isinstance(fixture["manufacturer"], str) or not _MFCT.fullmatch(fixture["manufacturer"]):
@@ -48,6 +60,15 @@ def validate_pending_fixture(fixture):
     return fixture
 
 
+def _reject_duplicate_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate encrypted fixture field: " + key)
+        result[key] = value
+    return result
+
+
 def load_pending_fixture(path):
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_fields)
     return validate_pending_fixture(payload)

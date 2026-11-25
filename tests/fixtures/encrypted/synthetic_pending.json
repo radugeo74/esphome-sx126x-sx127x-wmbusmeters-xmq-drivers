@@ -10,5 +10,6 @@
   "ciphertext_hex": "00112233445566778899aabbccddeeff",
   "iv_derivation": "unknown",
   "integrity_evidence": "not_verified",
-  "key_reference": "not_in_repository"
+  "key_reference": "not_in_repository",
+  "reference_url": null
 }

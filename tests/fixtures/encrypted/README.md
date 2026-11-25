@@ -15,3 +15,10 @@ Never store AES keys, real meter IDs, plaintext containing private readings,
 home-network credentials, or private device identifiers in the repository.
 Until protocol-specific validation and secure key provisioning are reviewed,
 these fixtures are **test inputs only** and cannot unlock sensor publishing.
+
+Public-reference fixtures must include a verifiable `https://` URL without
+credentials, query parameters or fragments. Synthetic fixtures must set
+`reference_url: null`. The loader rejects duplicate JSON keys, so a second
+`ci` or `security_configuration_hex` cannot silently override the first.
+A source URL documents provenance only; it does not verify the telegram or
+provide authorization to publish.

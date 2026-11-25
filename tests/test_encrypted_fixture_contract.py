@@ -1,5 +1,7 @@
 """Negative fixture policy tests; no cryptography or on-device decoder."""
 import copy
+import json
+from tempfile import TemporaryDirectory
 import importlib.util
 from pathlib import Path
 
@@ -24,6 +26,23 @@ reject(aes_key="0123456789abcdef0123456789abcdef")
 reject(key="00112233445566778899aabbccddeeff")
 reject(plaintext="hello")
 reject(source="private_meter_capture")
+reject(source="public_reference")
+reject(reference_url="https://example.com/claim")
+reject(source="public_reference", reference_url="http://example.com/frame")
+reject(source="public_reference", reference_url="https://user:pass@example.com/frame")
+reject(source="public_reference", reference_url="https://example.com/frame?key=secret")
+good_public = copy.deepcopy(fixture)
+good_public.update(source="public_reference", reference_url="https://example.com/documented-fixture")
+assert module.validate_pending_fixture(good_public) is good_public
+with TemporaryDirectory() as tmp:
+    duplicate = Path(tmp) / "duplicate.json"
+    duplicate.write_text(json.dumps(fixture)[:-1] + ', "ci": 7}', encoding="utf-8")
+    try:
+        module.load_pending_fixture(duplicate)
+    except ValueError as e:
+        assert "Duplicate" in str(e)
+    else:
+        raise AssertionError("Duplicate CI field accepted")
 reject(link_mode="UNKNOWN")
 reject(manufacturer="INVALID")
 reject(version=-1)
