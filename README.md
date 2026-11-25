@@ -182,3 +182,13 @@ cryptographic transformation does not establish the correct wM-Bus security
 mode, key/IV derivation, integrity or replay protection. This probe is kept
 in `tests/`, is **never linked into firmware**, and the runtime encrypted
 input gate still unconditionally refuses sensor publication.
+
+### AES-CMAC (RFC 4493) conformance — host tests only
+
+`tests/test_aes_cmac_rfc4493.cpp` checks the OpenSSL 3 EVP_MAC CMAC
+primitive against RFC 4493 section 4 vectors (0/16/40/64 bytes), detects a
+changed message, checks invalid key length and verifies the encrypted runtime
+gate still rejects output. Public test key only. This **does not assert** that
+any supported meter uses AES-CMAC: wM-Bus security mode, authenticated data,
+message layout, tag truncation, key binding and replay validation remain
+unverified, so no protocol MAC verifier is wired into firmware.

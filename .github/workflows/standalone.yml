@@ -89,6 +89,11 @@ jobs:
           set -euo pipefail
           python tests/scan_encrypted_fixtures.py
           python tests/test_encrypted_corpus.py
+      - name: Test AES-CMAC RFC 4493 host vectors, never authorize publication
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_aes_cmac_rfc4493.cpp -lcrypto -o /tmp/xmq-cmac
+          /tmp/xmq-cmac
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail
