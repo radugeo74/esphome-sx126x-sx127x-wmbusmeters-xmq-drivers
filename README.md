@@ -148,3 +148,15 @@ compiled for future research but cannot reach the XMQ decoder or publish
 sensors. An unknown security mode fails code generation. This adds no
 cryptographic authentication or decryption; such support must be implemented
 and tested independently before changing the gate.
+
+### Pending encrypted input boundary
+
+`encrypted_input_gate.h` defines a host-tested AES-128-CBC-shaped input
+contract (key, IV, ciphertext). It checks only length and block alignment.
+**No decryption, integrity/authentication proof, meter-key binding, or replay
+protection is implemented.** The pending decoder unconditionally rejects and
+clears all output; it is not wired to the live radio. Never place real meter
+keys in this repository or CI fixtures. Do not mark ciphertext as verified
+plaintext. Later implementation requires protocol-specific authenticated
+verification (or independently validated integrity strategy) before any
+sensor publication.

@@ -70,6 +70,11 @@ jobs:
           /tmp/xmq-signatures
       - name: Test pending encrypted mode cannot be decoded
         run: python tests/test_encrypted_pending.py
+      - name: Test encrypted input boundary always rejects until crypto is implemented
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_encrypted_input_gate.cpp -o /tmp/xmq-enc-gate
+          /tmp/xmq-enc-gate
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail
