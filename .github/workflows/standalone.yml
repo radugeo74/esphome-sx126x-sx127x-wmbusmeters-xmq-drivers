@@ -79,6 +79,11 @@ jobs:
         run: python tests/test_validated_transport_coverage.py
       - name: Verify approved clear-form transport MVT matches independent XMQ driver
         run: python tests/test_transport_mvt_consistency.py
+      - name: Decode mkradio4a warm and cold upstream OMS telegram fixtures
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_mkradio4a_upstream.cpp -o /tmp/xmq-mkradio4a
+          /tmp/xmq-mkradio4a
       - name: Test pending encrypted mode cannot be decoded
         run: python tests/test_encrypted_pending.py
       - name: Test encrypted input boundary always rejects until crypto is implemented
