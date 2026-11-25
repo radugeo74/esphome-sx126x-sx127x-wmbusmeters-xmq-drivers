@@ -84,6 +84,11 @@ jobs:
           set -euo pipefail
           g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_mkradio4a_upstream.cpp -o /tmp/xmq-mkradio4a
           /tmp/xmq-mkradio4a
+      - name: Parse mkradio4a CI72 full frames and verify inner meter identity
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_mkradio4a_ci72.cpp -o /tmp/xmq-mkradio4a-ci72
+          /tmp/xmq-mkradio4a-ci72
       - name: Test pending encrypted mode cannot be decoded
         run: python tests/test_encrypted_pending.py
       - name: Test encrypted input boundary always rejects until crypto is implemented
