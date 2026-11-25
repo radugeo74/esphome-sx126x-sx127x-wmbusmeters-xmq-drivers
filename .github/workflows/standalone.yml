@@ -58,6 +58,8 @@ jobs:
               assert func(original, "mkradio4") != func(modified, "mkradio4")
               print("INDEPENDENT_XMQ_DRIVER_REPLACEMENT_OK")
           PY
+      - name: Test new XMQ driver auto-discovery without activation
+        run: python tests/test_new_driver_isolation.py
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail
