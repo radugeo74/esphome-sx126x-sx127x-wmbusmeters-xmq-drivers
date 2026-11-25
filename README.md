@@ -245,3 +245,13 @@ family value could be treated as Water in the family comparison. Regression
 checks use a valid water payload with an invalid family and require empty
 output (including any stale driver, numeric and date values), then verify
 that valid Water still decodes. No new driver was approved.
+
+### Proprietary encoding boundary
+
+The transport-bound decoder only accepts `OriginalIxml` application
+encoding for the currently reviewed proprietary TCH A0/A2 clear-form
+signatures. `StandardDv` and unknown encoding enum values are rejected
+before the XMQ engine. Host checks also cover empty/oversize applications
+and require stale output to be cleared on failure. Standard DV decoding
+remains available in the independent XMQ engine for future explicitly
+reviewed transports; no encrypted support is enabled.

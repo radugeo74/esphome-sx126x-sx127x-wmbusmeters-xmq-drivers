@@ -49,6 +49,30 @@ int main() {
     out.driver = "stale";
     check(!decode_transport_bound(nullptr, w, "auto", out) && out.driver.empty(),
           "unapproved transport admitted");
+    // Proprietary TCH clear-form transport must never accept a caller
+    // reinterpreting the same application as generic standard DIF/VIF.
+    w.encoding = ApplicationEncoding::StandardDv;
+    out.driver = "stale";
+    check(!decode_transport_bound(water_transport, w, "auto", out) &&
+          out.driver.empty() && out.numeric.empty() && out.dates.empty(),
+          "standard DV encoding accepted for proprietary clear form");
+    w.encoding = static_cast<ApplicationEncoding>(0xff);
+    check(!decode_transport_bound(water_transport, w, "auto", out) &&
+          out.driver.empty(), "invalid encoding enum accepted");
+    w.encoding = ApplicationEncoding::OriginalIxml;
+    check(decode_transport_bound(water_transport, w, "auto", out) &&
+          out.driver == "mkradio4", "valid IXML encoding rejected");
+    w.application.clear();
+    out.driver = "stale";
+    check(!decode_transport_bound(water_transport, w, "auto", out) &&
+          out.driver.empty() && out.numeric.empty(),
+          "empty application accepted or stale output retained");
+    w.application = water;
+    w.application.resize(1025, 0);
+    check(!decode_transport_bound(water_transport, w, "auto", out) &&
+          out.driver.empty() && out.numeric.empty(),
+          "oversized application accepted");
+    w.application = water;
     w.trust = Trust::Ciphertext;
     check(!decode_transport_bound(water_transport, w, "auto", out) &&
           out.driver.empty() && out.numeric.empty(), "ciphertext admitted");
