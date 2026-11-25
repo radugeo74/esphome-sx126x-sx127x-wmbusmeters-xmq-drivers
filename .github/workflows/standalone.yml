@@ -38,13 +38,13 @@ jobs:
               shutil.copytree(base / "drivers", copied / "drivers")
               original = gen.generate_driver_header(copied).read_text()
               driver = copied / "drivers" / "mkradio4.xmq"
-              driver.write_text(driver.read_text() + "\\n// Driver-local update only\\n")
+              driver.write_text(driver.read_text() + "\n// Driver-local update only\n")
               modified = gen.generate_driver_header(copied).read_text()
               assert modified != original
               for name in ("fhkvdataiii", "mkradio4a"):
                   def func(text, name):
                       start = text.index("inline const char *source_" + name + "()")
-                      end = text.index("\\n}", start) + 2
+                      end = text.index("\n}", start) + 2
                       return text[start:end]
                   assert func(original, name) == func(modified, name)
               assert func(original, "mkradio4") != func(modified, "mkradio4")
