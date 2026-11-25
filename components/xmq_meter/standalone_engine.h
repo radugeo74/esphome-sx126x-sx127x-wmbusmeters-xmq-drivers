@@ -38,7 +38,9 @@ inline const xmq_runtime::DriverRegistry &validated_registry() {
 inline bool decode(const Input &input, xmq_runtime::XmqFrameResult &out,
                    const std::string &explicit_driver = "auto") noexcept {
   out = {};
-  if (input.trust != Trust::VerifiedCleartext) return false;
+  if (input.trust != Trust::VerifiedCleartext ||
+      (input.family != Family::Heat && input.family != Family::Water))
+    return false;
   try {
     const auto &registry = validated_registry();
     const auto &selected = registry.select(

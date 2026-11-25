@@ -236,3 +236,12 @@ The existing CI workflow now checks each approved driver’s `detect.mvt`
 entries against the set of MVT tuples admitted by its `clear_form`
 transport signatures. A missing or invented allowed MVT fails the build.
 This test uses no keys and makes no changes to the radio receiver or firmware.
+
+### Fail-closed meter family enumeration
+
+The standalone decoder now rejects enum values other than explicit `Heat`
+and `Water` before consulting the registry. Previously, an out-of-range
+family value could be treated as Water in the family comparison. Regression
+checks use a valid water payload with an invalid family and require empty
+output (including any stale driver, numeric and date values), then verify
+that valid Water still decodes. No new driver was approved.

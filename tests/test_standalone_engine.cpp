@@ -25,6 +25,17 @@ int main() {
           "unvalidated mkradio4a must not be silently activated");
     check(!decode(w,out,"bad") && out.numeric.empty(),
           "unknown driver admitted");
+    // An invalid Family enum must never be interpreted as Water.
+    // In particular, stale results from a previously decoded meter
+    // must be cleared before rejecting an invalid input.
+    w.family = static_cast<Family>(0xff);
+    out.driver = "stale";
+    check(!decode(w,out) && out.driver.empty() &&
+          out.numeric.empty() && out.dates.empty(),
+          "invalid family enum accepted or stale output preserved");
+    w.family = Family::Water;
+    check(decode(w,out) && out.driver == "mkradio4",
+          "valid water family not restored after invalid enum");
     w.inner_mvt={"TCH",0x70,0x72};
     check(decode(w,out,"auto"), "auto did not select MK4 alternate MVT");
     check(out.driver=="mkradio4", "auto chose incorrect water driver");
