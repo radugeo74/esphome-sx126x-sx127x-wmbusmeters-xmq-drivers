@@ -220,3 +220,12 @@ prefixes, different drivers and clear-form versus encrypted-pending entries.
 This prevents a shorter clear-form signature from bypassing the future
 `encrypted_pending` gate. The existing reviewed 14 signatures are unchanged;
 CI checks both negative collisions and a non-overlapping pending entry.
+
+### Validated driver transport coverage
+
+The driver generator rejects a reviewed profile if it has no admissible
+`clear_form` transport signature, including profiles whose signatures were
+all changed to `encrypted_pending`. This prevents an apparently enabled
+YAML driver from silently having no approved transport. It does not authorize
+any new driver or enable AES decoding. CI uses temporary fixtures for the
+negative cases and leaves the 14 reviewed signatures unchanged.

@@ -149,6 +149,14 @@ def generate_driver_header(component_dir: Path) -> Path:
         declarations.append(
             f'    {{"{name}", {version}, {typ}, {ci}, {len(prefix)}, {0 if security == "clear_form" else 1}, '
             f'{{{padded[0]}, {padded[1]}, {padded[2]}}}}},')
+    clear_drivers = {
+        name for name, _, _, _, _, security in prior_signatures
+        if security == "clear_form"
+    }
+    missing_clear = approved - clear_drivers
+    if missing_clear:
+        raise ValueError("Approved XMQ drivers without clear-form transport: "
+                         + ", ".join(sorted(missing_clear)))
     declarations.extend([
         "  };",
         "  count = sizeof(signatures) / sizeof(signatures[0]);",
