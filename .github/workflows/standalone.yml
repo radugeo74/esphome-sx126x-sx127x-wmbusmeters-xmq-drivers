@@ -68,6 +68,8 @@ jobs:
           set -euo pipefail
           g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_transport_signatures.cpp -o /tmp/xmq-signatures
           /tmp/xmq-signatures
+      - name: Test pending encrypted mode cannot be decoded
+        run: python tests/test_encrypted_pending.py
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail

@@ -138,3 +138,13 @@ This replaces hard-coded A0/A2/version/type/application-prefix branches in
 alone cannot authorize a transport envelope or publication. Signatures are
 **not** cryptographic authentication; encrypted/security modes need a
 separate reviewed decrypt-and-verify path before being enabled.
+
+### Explicit transport security policy
+
+`transport_signatures.json` now distinguishes `security: clear_form` from
+`security: encrypted_pending`. The runtime matcher accepts **only** the
+reviewed `clear_form` signatures. Any `encrypted_pending` signature is
+compiled for future research but cannot reach the XMQ decoder or publish
+sensors. An unknown security mode fails code generation. This adds no
+cryptographic authentication or decryption; such support must be implemented
+and tested independently before changing the gate.

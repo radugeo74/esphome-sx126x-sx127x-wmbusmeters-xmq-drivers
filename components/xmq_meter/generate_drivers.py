@@ -108,7 +108,7 @@ def generate_driver_header(component_dir: Path) -> Path:
     declarations.extend([
         "namespace xmq_runtime {",
         "struct TransportSignature {",
-        "  const char *driver; unsigned char version, type, ci, prefix_len;",
+        "  const char *driver; unsigned char version, type, ci, prefix_len, security_mode;",
         "  unsigned char prefix[3];",
         "};",
         "inline const TransportSignature *transport_signature_catalog(std::size_t &count) {",
@@ -116,10 +116,13 @@ def generate_driver_header(component_dir: Path) -> Path:
     ])
     duplicate = set()
     for item in signatures:
-        if not isinstance(item, dict) or set(item) != {"driver", "version", "type", "ci", "prefix"}:
+        if not isinstance(item, dict) or set(item) != {"driver", "version", "type", "ci", "prefix", "security"}:
             raise ValueError("Invalid XMQ transport signature")
         name, version, typ, ci, prefix = (
             item["driver"], item["version"], item["type"], item["ci"], item["prefix"])
+        security = item["security"]
+        if security not in ("clear_form", "encrypted_pending"):
+            raise ValueError("Unsupported XMQ security mode")
         if not isinstance(name, str) or name not in approved:
             raise ValueError("Unapproved transport driver")
         if any(type(v) is not int or not (0 <= v <= 255) for v in (version, typ, ci)):
@@ -134,7 +137,7 @@ def generate_driver_header(component_dir: Path) -> Path:
         duplicate.add(key)
         padded = prefix + [0] * (3 - len(prefix))
         declarations.append(
-            f'    {{"{name}", {version}, {typ}, {ci}, {len(prefix)}, '
+            f'    {{"{name}", {version}, {typ}, {ci}, {len(prefix)}, {0 if security == "clear_form" else 1}, '
             f'{{{padded[0]}, {padded[1]}, {padded[2]}}}}},')
     declarations.extend([
         "  };",
@@ -150,7 +153,7 @@ def generate_driver_header(component_dir: Path) -> Path:
         "  const char *match = nullptr;",
         "  for (std::size_t i = 0; i < count; ++i) {",
         "    const auto &sig = entries[i];",
-        "    if (sig.version != version || sig.type != type || sig.ci != ci ||",
+        "    if (sig.security_mode != 0 || sig.version != version || sig.type != type || sig.ci != ci ||",
         "        length < sig.prefix_len ||",
         "        std::memcmp(application, sig.prefix, sig.prefix_len) != 0) continue;",
         "    if (match != nullptr && std::strcmp(match, sig.driver) != 0) return nullptr;",

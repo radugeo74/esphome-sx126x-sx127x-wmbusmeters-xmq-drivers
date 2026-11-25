@@ -6,7 +6,8 @@
     "ci": 160,
     "prefix": [
       17
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "fhkvdataiii",
@@ -15,7 +16,8 @@
     "ci": 160,
     "prefix": [
       15
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "fhkvdataiii",
@@ -24,7 +26,8 @@
     "ci": 160,
     "prefix": [
       1
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "fhkvdataiii",
@@ -33,7 +36,8 @@
     "ci": 160,
     "prefix": [
       17
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "fhkvdataiii",
@@ -42,7 +46,8 @@
     "ci": 160,
     "prefix": [
       15
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "fhkvdataiii",
@@ -51,7 +56,8 @@
     "ci": 160,
     "prefix": [
       1
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -62,7 +68,8 @@
       6,
       62,
       53
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -73,7 +80,8 @@
       6,
       112,
       41
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -84,7 +92,8 @@
       6,
       62,
       53
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -95,7 +104,8 @@
       6,
       112,
       41
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -106,7 +116,8 @@
       6,
       62,
       53
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -117,7 +128,8 @@
       6,
       112,
       41
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -128,7 +140,8 @@
       6,
       62,
       53
-    ]
+    ],
+    "security": "clear_form"
   },
   {
     "driver": "mkradio4",
@@ -139,6 +152,7 @@
       6,
       112,
       41
-    ]
+    ],
+    "security": "clear_form"
   }
 ]

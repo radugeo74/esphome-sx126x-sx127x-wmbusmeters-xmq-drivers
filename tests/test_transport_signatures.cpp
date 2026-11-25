@@ -11,6 +11,7 @@ int main() {
   for (std::size_t i = 0; i < count; ++i) {
     const auto &s = signatures[i];
     assert(s.prefix_len >= 1 && s.prefix_len <= 3);
+    assert(s.security_mode == 0);
     const auto *match = match_transport_signature(
         s.version, s.type, s.ci, s.prefix, s.prefix_len);
     assert(match != nullptr && std::strcmp(match, s.driver) == 0);
