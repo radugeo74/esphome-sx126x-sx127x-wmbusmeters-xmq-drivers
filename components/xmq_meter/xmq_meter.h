@@ -1,6 +1,7 @@
 #pragma once
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/wmbus_radio/component.h"
 #include "standalone_engine.h"
 #include <cstdint>
@@ -17,6 +18,9 @@ class Meter : public Component {
   void add_sensor(std::string name, sensor::Sensor *s) {
     sensors_.emplace_back(std::move(name), s);
   }
+  void add_text_sensor(std::string name, text_sensor::TextSensor *s) {
+    text_sensors_.emplace_back(std::move(name), s);
+  }
   void dump_config() override {
     ESP_LOGCONFIG("xmq_meter", "XMQ primary meter family=%s, ID=REDACTED", heat_ ? "heat" : "water");
   }
@@ -27,5 +31,6 @@ class Meter : public Component {
   bool heat_{false};
   std::string driver_{"auto"};
   std::vector<std::pair<std::string, sensor::Sensor *>> sensors_;
+  std::vector<std::pair<std::string, text_sensor::TextSensor *>> text_sensors_;
 };
 }} // namespace esphome::xmq_meter

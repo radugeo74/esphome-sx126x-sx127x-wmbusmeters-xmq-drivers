@@ -266,3 +266,14 @@ Host regressions check both original warm/cold specimens, wrong inner ID,
 missing volume/date, invalid date and stale-output clearing. The
 candidate does not register mkradio4a for live sensors and does not decode
 the encrypted manufacturer-specific tail. No new real meter keys are needed.
+
+### mkradio4a experimental ESPHome CI72 output
+
+The existing `xmq_meter` now supports explicit `driver: mkradio4a`
+for `family: water` using the bounded CI72 candidate with the **inner**
+BCD meter ID. It publishes `target_m3` (numeric), `target_date` (text
+sensor in YYYY-MM-DD) and optional RSSI, only if the volume and date are
+both present and valid. The synthetic Heltec CI build includes this opt-in
+instance. This is **not enabled for `driver: auto`**, not part of the
+manifest-approved proprietary signatures, and does not interpret encrypted
+telegrams. Do not flash the build-only CI YAML or change the stable main.

@@ -1,5 +1,6 @@
 #include "xmq_meter.h"
 #include "transport_driver_binding.h"
+#include "mkradio4a_candidate.h"
 #include <cmath>
 #include <utility>
 namespace esphome { namespace xmq_meter {
@@ -20,6 +21,34 @@ void Meter::handle_frame_(wmbus_radio::Frame *frame) {
   const auto &dll = frame->data();
   if (dll.size() < 20 || dll.size() > 256 || dll.size() != size_t(dll[0]) + 1 ||
       dll[1] != 0x44 || dll[2] != 0x68 || dll[3] != 0x50) return;
+  // Experimental opt-in only: CI72 uses the INNER BCD meter identity, not
+  // the outer Techem radio-converter ID. Existing auto/A0/A2 paths stay intact.
+  if (this->driver_ == "mkradio4a") {
+    if (this->heat_ || dll[10] != 0x72) return;
+    xmq_runtime::XmqFrameResult output;
+    if (!xmq_standalone::decode_mkradio4a_ci72_candidate(
+            dll, this->meter_id_, output)) return;
+    const float rssi = float(frame->rssi());
+    frame->mark_as_handled();
+    if (this->radio_ != nullptr) this->radio_->note_xmq_decoded(true);
+    this->defer([this, output = std::move(output), rssi]() {
+      for (const auto &entry : this->sensors_) {
+        if (entry.first == "rssi_dbm") {
+          entry.second->publish_state(rssi);
+          continue;
+        }
+        const auto found = output.numeric.find(entry.first);
+        if (found != output.numeric.end() && std::isfinite(found->second.value))
+          entry.second->publish_state(float(found->second.value));
+      }
+      for (const auto &entry : this->text_sensors_) {
+        const auto found = output.dates.find(entry.first);
+        if (found != output.dates.end())
+          entry.second->publish_state(found->second);
+      }
+    });
+    return;
+  }
   const uint32_t address = uint32_t(dll[4]) |
       uint32_t(dll[5]) << 8 | uint32_t(dll[6]) << 16 |
       uint32_t(dll[7]) << 24;

@@ -12,12 +12,13 @@ spec.loader.exec_module(mod)
 families = mod.approved_families(ROOT)
 assert families == {"fhkvdataiii": "heat", "mkradio4": "water"}
 for family, driver in (("heat", "auto"), ("water", "auto"),
-                       ("heat", "fhkvdataiii"), ("water", "mkradio4")):
+                       ("heat", "fhkvdataiii"), ("water", "mkradio4"),
+                       ("water", "mkradio4a")):
     conf = {"family": family, "driver": driver}
     assert mod.validate_driver_family(conf, families) is conf
 
 for family, driver in (("heat", "mkradio4"), ("water", "fhkvdataiii"),
-                       ("water", "mkradio4a"), ("water", "unapproved")):
+                       ("heat", "mkradio4a"), ("water", "unapproved")):
     try:
         mod.validate_driver_family({"family": family, "driver": driver}, families)
     except ValueError:

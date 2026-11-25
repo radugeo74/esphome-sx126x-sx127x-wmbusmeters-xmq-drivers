@@ -28,6 +28,12 @@ def validate_driver_family(config, families):
         raise ValueError("Invalid XMQ meter family")
     if driver == "auto":
         return config
+    # Explicit, experimental CI72 candidate only. This is intentionally NOT
+    # part of the manifest-approved auto driver registry.
+    if driver == "mkradio4a":
+        if family != "water":
+            raise ValueError("mkradio4a requires water family")
+        return config
     if driver not in families:
         raise ValueError("Driver is not in the reviewed XMQ profiles")
     if families[driver] != family:

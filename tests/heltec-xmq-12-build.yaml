@@ -207,3 +207,17 @@ xmq_meter:
       name: "CI XMQ Water 12 total_m3"
     rssi_dbm:
       name: "CI XMQ Water 12 rssi_dbm"
+
+  # EXPERIMENTAL, build-only: explicit CI72 mkradio4a with INNER ID.
+  # These synthetic credentials and IDs must never be flashed.
+  - id: xmq_mkradio4a_ci72_lab
+    radio_id: receiver
+    meter_id: 0x66953825
+    family: water
+    driver: mkradio4a
+    target_m3:
+      name: "CI XMQ MK4A target_m3"
+    target_date:
+      name: "CI XMQ MK4A target_date"
+    rssi_dbm:
+      name: "CI XMQ MK4A rssi_dbm"
