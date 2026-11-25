@@ -39,7 +39,8 @@ check_case(dict(original[0], security="encrypted_pending"), expected="Overlappin
 water = next(x for x in original if x["driver"] == "mkradio4")
 check_case(dict(water, prefix=[6], security="encrypted_pending"), expected="Overlapping")
 # Longer prefix may match all the same traffic as an existing shorter entry.
-check_case(dict(water, prefix=water["prefix"] + [123]), expected="Overlapping")
+heat = next(x for x in original if x["driver"] == "fhkvdataiii")
+check_case(dict(heat, prefix=heat["prefix"] + [123]), expected="Overlapping")
 # Different driver but colliding version, type, CI and prefix is prohibited.
 check_case(dict(water, driver="fhkvdataiii"), expected="Overlapping")
 # Non-overlapping prefix with same MVT is safe to describe, but still requires
