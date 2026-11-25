@@ -121,3 +121,10 @@ requires no engine changes. New .xmq files appear in the source catalog but
 cannot publish without an independently reviewed profile, security envelope,
 and verified output mapping. The radio adapter still accepts only the proven
 proprietary Techem T1 envelopes.
+
+### Family validation in YAML (experimental)
+
+When `driver:` is explicit, ESPHome validation rejects an unapproved driver or a
+mismatch between `driver` and `family` **before compilation**. `driver: auto`
+remains available; its actual selection is performed from MVT in the reviewed
+runtime registry. This check does not broaden the radio/security adaptor.

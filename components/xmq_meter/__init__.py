@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 from .generate_drivers import generate_driver_header
+from .profile_validation import approved_families, validate_driver_family
 
 # Generate before ESPHome resource discovery copies *.h sources to build dir.
 generate_driver_header(Path(__file__).resolve().parent)
@@ -24,9 +25,17 @@ CONF_RADIO_ID = "radio_id"
 CONF_METER_ID = "meter_id"
 CONF_FAMILY = "family"
 CONF_DRIVER = "driver"
-VALIDATED_DRIVERS = tuple(p["driver"] for p in json.loads((Path(__file__).resolve().parent / "validated_profiles.json").read_text(encoding="utf-8")))
+APPROVED_FAMILIES = approved_families(Path(__file__).resolve().parent)
+VALIDATED_DRIVERS = tuple(APPROVED_FAMILIES)
 
-CONFIG_SCHEMA = cv.Schema({
+def _validate_meter_profile(config):
+    try:
+        return validate_driver_family(config, APPROVED_FAMILIES)
+    except ValueError as exc:
+        raise cv.Invalid(str(exc)) from exc
+
+
+CONFIG_SCHEMA = cv.All(cv.Schema({
     cv.GenerateID(): cv.declare_id(Meter),
     cv.Required(CONF_RADIO_ID): cv.use_id(RadioComponent),
     cv.Required(CONF_METER_ID): cv.hex_int,
@@ -34,7 +43,7 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_DRIVER, default="auto"): cv.one_of("auto", *VALIDATED_DRIVERS, lower=True),
     **{cv.Optional(name): sensor.sensor_schema(accuracy_decimals=1)
        for name in FIELDS},
-}).extend(cv.COMPONENT_SCHEMA)
+}).extend(cv.COMPONENT_SCHEMA), _validate_meter_profile)
 
 
 async def to_code(config):

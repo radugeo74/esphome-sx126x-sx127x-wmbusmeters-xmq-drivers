@@ -60,6 +60,8 @@ jobs:
           PY
       - name: Test new XMQ driver auto-discovery without activation
         run: python tests/test_new_driver_isolation.py
+      - name: Test approved driver and YAML family consistency
+        run: python tests/test_yaml_profile_validation.py
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail
