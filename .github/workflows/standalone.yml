@@ -68,6 +68,11 @@ jobs:
           set -euo pipefail
           g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_transport_signatures.cpp -o /tmp/xmq-signatures
           /tmp/xmq-signatures
+      - name: Verify transport-approved driver binds MVT and XMQ output
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_transport_driver_binding.cpp -o /tmp/xmq-transport-binding
+          /tmp/xmq-transport-binding
       - name: Test pending encrypted mode cannot be decoded
         run: python tests/test_encrypted_pending.py
       - name: Test encrypted input boundary always rejects until crypto is implemented

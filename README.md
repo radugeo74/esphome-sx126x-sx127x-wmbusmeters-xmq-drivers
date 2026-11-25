@@ -192,3 +192,13 @@ gate still rejects output. Public test key only. This **does not assert** that
 any supported meter uses AES-CMAC: wM-Bus security mode, authenticated data,
 message layout, tag truncation, key binding and replay validation remain
 unverified, so no protocol MAC verifier is wired into firmware.
+
+### Transport-to-driver binding for auto selection
+
+After a T1 clear-form transport signature is accepted, the decoder is now
+explicitly constrained to the **same reviewed driver** even for YAML
+`driver: auto`. MVT detection, required primary fields, and the projected
+result must agree before any HA sensor publish. Host regression checks cover
+both approved meter families, explicit mismatch, cross-family payloads,
+unknown transport and ciphertext rejection. This does not implement or enable
+encrypted telegram decoding.

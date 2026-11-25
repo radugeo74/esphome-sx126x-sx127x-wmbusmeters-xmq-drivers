@@ -46,8 +46,12 @@ void Meter::handle_frame_(wmbus_radio::Frame *frame) {
       xmq_standalone::Trust::VerifiedCleartext};
   xmq_runtime::XmqFrameResult output;
   const uint32_t start = micros();
-  if (!xmq_standalone::decode(in, output, this->driver_)) {
-    ESP_LOGW(TAG, "XMQ primary incomplete: suppressing stale sensor values");
+  // Bind the *transport-approved* driver to the MVT and XMQ field
+  // projection. In auto mode never independently choose a different
+  // driver after a proprietary transport signature has been admitted.
+  if (!xmq_standalone::decode(in, output, transport_driver) ||
+      output.driver != transport_driver) {
+    ESP_LOGW(TAG, "XMQ transport/driver binding failed: no sensor publication");
     return;
   }
   frame->mark_as_handled();
