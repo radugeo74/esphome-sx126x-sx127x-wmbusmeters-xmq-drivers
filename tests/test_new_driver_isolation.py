@@ -25,14 +25,20 @@ with TemporaryDirectory() as directory:
     before = gen.generate_driver_header(temp).read_text(encoding="utf-8")
     new_driver = temp / "drivers" / "synthetic_meter.xmq"
     new_driver.write_text(
-        "driver {\\n"
-        "  name = synthetic_meter\\n"
-        "  meter_type = WaterMeter\\n"
-        "  manufacturer = Test\\n"
-        "  detect { mvt = TST,01,02 }\\n"
-        "  fields { field { name = synthetic\\n"
-        "                   quantity = Volume } }\\n"
-        "}\\n",
+        "driver {\n"
+        "  name = synthetic_meter\n"
+        "  meter_type = WaterMeter\n"
+        "  manufacturer = Test\n"
+        "  detect {\n"
+        "    mvt = TST,01,02\n"
+        "  }\n"
+        "  fields {\n"
+        "    field {\n"
+        "      name = synthetic\n"
+        "      quantity = Volume\n"
+        "    }\n"
+        "  }\n"
+        "}\n",
         encoding="utf-8",
     )
     after = gen.generate_driver_header(temp).read_text(encoding="utf-8")
@@ -53,7 +59,7 @@ with TemporaryDirectory() as directory:
 
 int main() {
   std::size_t all_count = 0;
-  auto all = xmq_runtime::driver_catalog(all_count);
+  (void)xmq_runtime::driver_catalog(all_count);
   assert(all_count == 4);
   assert(xmq_runtime::source_by_name("synthetic_meter") != nullptr);
   std::size_t approved_count = 0;
@@ -83,7 +89,7 @@ int main() {
   assert(out.numeric.empty() && out.dates.empty());
   assert(!xmq_standalone::decode(input, out, "synthetic_meter"));
   assert(out.numeric.empty() && out.dates.empty());
-  std::cout << "XMQ_UNAPPROVED_DRIVER_FAIL_CLOSED_OK" << '\\n';
+  std::cout << "XMQ_UNAPPROVED_DRIVER_FAIL_CLOSED_OK" << '\n';
 }
 ''', encoding="utf-8")
     executable = temp / "new_driver_test"
@@ -95,7 +101,7 @@ int main() {
     )
     subprocess.run([str(executable)], check=True)
     # Invalid filenames and mismatched names must fail generation.
-    new_driver.write_text("driver { name = different }\\n", encoding="utf-8")
+    new_driver.write_text("driver { name = different }\n", encoding="utf-8")
     try:
         gen.generate_driver_header(temp)
     except ValueError as exc:
