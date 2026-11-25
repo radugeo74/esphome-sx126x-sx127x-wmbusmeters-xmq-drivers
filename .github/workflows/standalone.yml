@@ -44,7 +44,9 @@ jobs:
               for name in ("fhkvdataiii", "mkradio4a"):
                   def func(text, name):
                       start = text.index("inline const char *source_" + name + "()")
-                      end = text.index("\n}", start) + 2
+                      end = text.find("inline const char *source_", start + 1)
+                      if end == -1:
+                          end = text.index("}  // namespace xmq_runtime", start)
                       return text[start:end]
                   assert func(original, name) == func(modified, name)
               assert func(original, "mkradio4") != func(modified, "mkradio4")
@@ -58,7 +60,11 @@ jobs:
       - name: Install ESPHome 2026.11.0
         run: python -m pip install --disable-pip-version-check "esphome==2026.11.0"
       - name: Compile Heltec SX126x with 12 synthetic XMQ sensors
-        run: esphome compile tests/heltec-xmq-12-build.yaml
+        run: |
+          set -euo pipefail
+          rm -f components/xmq_meter/xmq_driver_sources.h
+          esphome compile tests/heltec-xmq-12-build.yaml
+          test -e components/xmq_meter/xmq_driver_sources.h
       - name: Compile LILYGO SX127x without meter sensors
         run: esphome compile tests/lilygo-sx127x-radio-build.yaml
       - name: Assert no legacy dependencies
