@@ -22,3 +22,8 @@ credentials, query parameters or fragments. Synthetic fixtures must set
 `ci` or `security_configuration_hex` cannot silently override the first.
 A source URL documents provenance only; it does not verify the telegram or
 provide authorization to publish.
+
+CI scans **all** `.json` entries in this directory (rather than only the
+synthetic sample), rejects duplicate metadata/ciphertext tuples and applies
+the strict fixture contract to every entry. It does not fetch provenance URLs
+or infer any validated OMS security mode from the fixture contents.

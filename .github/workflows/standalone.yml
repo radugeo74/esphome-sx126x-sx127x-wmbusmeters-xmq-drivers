@@ -84,6 +84,11 @@ jobs:
           /tmp/xmq-aes-host
       - name: Test encrypted WMBus fixture intake rejects missing metadata and secrets
         run: python tests/test_encrypted_fixture_contract.py
+      - name: Scan every encrypted reference fixture for duplicates and unsafe claims
+        run: |
+          set -euo pipefail
+          python tests/scan_encrypted_fixtures.py
+          python tests/test_encrypted_corpus.py
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail
