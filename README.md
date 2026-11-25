@@ -172,3 +172,13 @@ publish. No encrypted data is passed to `standalone_engine`; the pending
 runtime adapter continues to reject all encrypted telegrams. The actual
 OMS security mode, IV construction, key derivation and replay policy are
 still unimplemented pending protocol-specific reference frames.
+
+### Host-only C++ AES-CBC primitive probe
+
+`tests/test_aes_cbc_host_probe.cpp` exercises native OpenSSL EVP AES-128-CBC
+against the public NIST vector, including a manipulated IV and invalid block
+length. Its result type is deliberately named `UnauthenticatedPlaintext`;
+cryptographic transformation does not establish the correct wM-Bus security
+mode, key/IV derivation, integrity or replay protection. This probe is kept
+in `tests/`, is **never linked into firmware**, and the runtime encrypted
+input gate still unconditionally refuses sensor publication.

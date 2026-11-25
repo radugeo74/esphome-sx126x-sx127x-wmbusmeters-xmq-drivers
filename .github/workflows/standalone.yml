@@ -77,6 +77,11 @@ jobs:
           /tmp/xmq-enc-gate
       - name: Test AES-128-CBC NIST vector offline; no publishing authorization
         run: python tests/test_aes_cbc_nist_vector.py
+      - name: Test native AES-CBC primitive host-only, no ESPHome publication
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_aes_cbc_host_probe.cpp -lcrypto -o /tmp/xmq-aes-host
+          /tmp/xmq-aes-host
       - name: Test independent T1/C1 PHY CRC
         run: |
           set -euo pipefail
