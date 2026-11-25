@@ -229,3 +229,10 @@ all changed to `encrypted_pending`. This prevents an apparently enabled
 YAML driver from silently having no approved transport. It does not authorize
 any new driver or enable AES decoding. CI uses temporary fixtures for the
 negative cases and leaves the 14 reviewed signatures unchanged.
+
+### Static transport/MVT consistency check
+
+The existing CI workflow now checks each approved driver’s `detect.mvt`
+entries against the set of MVT tuples admitted by its `clear_form`
+transport signatures. A missing or invented allowed MVT fails the build.
+This test uses no keys and makes no changes to the radio receiver or firmware.

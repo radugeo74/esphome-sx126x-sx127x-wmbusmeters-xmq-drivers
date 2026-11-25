@@ -77,6 +77,8 @@ jobs:
         run: python tests/test_transport_signature_collisions.py
       - name: Ensure each validated driver has reviewed clear-form transport
         run: python tests/test_validated_transport_coverage.py
+      - name: Verify approved clear-form transport MVT matches independent XMQ driver
+        run: python tests/test_transport_mvt_consistency.py
       - name: Test pending encrypted mode cannot be decoded
         run: python tests/test_encrypted_pending.py
       - name: Test encrypted input boundary always rejects until crypto is implemented
