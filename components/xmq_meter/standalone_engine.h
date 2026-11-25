@@ -24,7 +24,7 @@ inline bool decode(const Input &input, xmq_runtime::XmqFrameResult &out) noexcep
   try {
     if (input.family == Family::Heat) {
       static const xmq_runtime::DriverRegistry registry({
-          xmq_runtime::load_driver(xmq_runtime::source_fhkvdataiii())});
+          xmq_runtime::load_driver(xmq_runtime::source_by_name("fhkvdataiii"))});
       return xmq_runtime::decode_primary_candidate(
           registry, input.inner_mvt, input.encoding, input.application,
           "fhkvdataiii",
@@ -33,7 +33,7 @@ inline bool decode(const Input &input, xmq_runtime::XmqFrameResult &out) noexcep
     }
     if (input.family == Family::Water) {
       static const xmq_runtime::DriverRegistry registry({
-          xmq_runtime::load_driver(xmq_runtime::source_mkradio4())});
+          xmq_runtime::load_driver(xmq_runtime::source_by_name("mkradio4"))});
       return xmq_runtime::decode_primary_candidate(
           registry, input.inner_mvt, input.encoding, input.application,
           "mkradio4", {"target_m3", "total_m3"}, {}, out);

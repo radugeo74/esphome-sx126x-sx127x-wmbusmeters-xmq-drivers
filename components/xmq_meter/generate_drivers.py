@@ -21,6 +21,8 @@ def generate_driver_header(component_dir: Path) -> Path:
         "#pragma once",
         "// GENERATED from drivers/*.xmq; never modify directly.",
         "// Edit only the individual .xmq file.",
+        "#include <cstddef>",
+        "#include <cstring>",
         "namespace xmq_runtime {",
     ]
     seen = set()
@@ -43,7 +45,29 @@ def generate_driver_header(component_dir: Path) -> Path:
             f'  return R"{delimiter}({content}){delimiter}";',
             "}",
         ])
-    declarations.append("}  // namespace xmq_runtime")
+    # Names are embedded in one generated index; no handwritten list to maintain.
+    declarations.extend([
+        "struct DriverSource { const char *name; const char *source; };",
+        "inline const DriverSource *driver_catalog(std::size_t &count) {",
+        "  static const DriverSource entries[] = {",
+    ])
+    for name in sorted(seen):
+        declarations.append(f'    {{"{name}", source_{name}()}},')
+    declarations.extend([
+        "  };",
+        "  count = sizeof(entries) / sizeof(entries[0]);",
+        "  return entries;",
+        "}",
+        "inline const char *source_by_name(const char *name) {",
+        "  if (name == nullptr) return nullptr;",
+        "  std::size_t count = 0;",
+        "  const DriverSource *entries = driver_catalog(count);",
+        "  for (std::size_t i = 0; i < count; ++i)",
+        "    if (std::strcmp(name, entries[i].name) == 0) return entries[i].source;",
+        "  return nullptr;",
+        "}",
+        "}  // namespace xmq_runtime",
+    ])
     generated = "\n".join(declarations) + "\n"
     target = component_dir / _HEADER
     if not target.exists() or target.read_text(encoding="utf-8") != generated:

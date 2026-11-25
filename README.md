@@ -65,3 +65,12 @@ those are separate configuration/engine changes when needed.
 
 Workflow validates independent replacement of a single driver without
 changing the generated function bodies of other drivers.
+
+## Experimental development: auto-generated driver catalog
+
+This branch generates a catalog from all `drivers/*.xmq` files and validates
+its entries with host tests. The standalone engine now looks up existing
+`fhkvdataiii` and `mkradio4` sources by catalog name rather than referencing
+individual C++ source functions. This **does not yet enable new meter types
+through YAML**. The stable `main` branch is unchanged; do not flash this
+experimental branch until its CI and hardware testing are complete.

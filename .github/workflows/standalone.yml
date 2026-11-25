@@ -1,7 +1,7 @@
 name: XMQ standalone — two radios
 on:
   push:
-    branches: [main]
+    branches: [experimental/xmq-auto-drivers]
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,6 +16,11 @@ jobs:
       - uses: actions/checkout@v5
       - name: Generate C++ driver header from independent XMQ sources
         run: python components/xmq_meter/generate_drivers.py
+      - name: Test auto-generated XMQ driver catalog and MVT selection
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -Icomponents/xmq_meter tests/test_driver_catalog.cpp -o /tmp/xmq-catalog
+          /tmp/xmq-catalog
       - name: Test standalone XMQ engine with synthetic meters
         run: |
           set -euo pipefail
