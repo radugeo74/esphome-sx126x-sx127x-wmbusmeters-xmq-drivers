@@ -41,6 +41,7 @@ jobs:
           with TemporaryDirectory() as tmp:
               copied = Path(tmp)
               shutil.copytree(base / "drivers", copied / "drivers")
+              shutil.copy2(base / "validated_profiles.json", copied / "validated_profiles.json")
               original = gen.generate_driver_header(copied).read_text()
               driver = copied / "drivers" / "mkradio4.xmq"
               driver.write_text(driver.read_text() + "\n// Driver-local update only\n")
