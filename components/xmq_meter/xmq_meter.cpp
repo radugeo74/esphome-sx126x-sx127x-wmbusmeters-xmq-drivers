@@ -1,4 +1,5 @@
 #include "xmq_meter.h"
+#include "transport_driver_binding.h"
 #include <cmath>
 #include <utility>
 namespace esphome { namespace xmq_meter {
@@ -32,10 +33,6 @@ void Meter::handle_frame_(wmbus_radio::Frame *frame) {
     ESP_LOGW(TAG, "XMQ frame rejected: unapproved transport envelope");
     return;
   }
-  if (this->driver_ != "auto" && this->driver_ != transport_driver) {
-    ESP_LOGW(TAG, "XMQ frame rejected: selected driver/transport mismatch");
-    return;
-  }
   // Exact known proprietary clear-form signatures only. They are NOT
   // cryptographic proof: these water/heat formats have no independent MAC.
   xmq_standalone::Input in{
@@ -49,8 +46,8 @@ void Meter::handle_frame_(wmbus_radio::Frame *frame) {
   // Bind the *transport-approved* driver to the MVT and XMQ field
   // projection. In auto mode never independently choose a different
   // driver after a proprietary transport signature has been admitted.
-  if (!xmq_standalone::decode(in, output, transport_driver) ||
-      output.driver != transport_driver) {
+  if (!xmq_standalone::decode_transport_bound(
+          transport_driver, in, this->driver_, output)) {
     ESP_LOGW(TAG, "XMQ transport/driver binding failed: no sensor publication");
     return;
   }

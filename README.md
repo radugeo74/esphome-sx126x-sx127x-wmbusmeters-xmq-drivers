@@ -202,3 +202,12 @@ result must agree before any HA sensor publish. Host regression checks cover
 both approved meter families, explicit mismatch, cross-family payloads,
 unknown transport and ciphertext rejection. This does not implement or enable
 encrypted telegram decoding.
+
+### Single shared transport-driver binding implementation
+
+`transport_driver_binding.h` now contains the actual fail-closed binding
+used in **both** the ESPHome frame handler and host regression test. The
+previous test-local copy has been removed, so tests exercise the same
+implementation that controls publication. Unknown transport, mismatched
+explicit driver, mismatched MVT/family and ciphertext all clear output and
+reject before any sensor publish. No encryption features were enabled.

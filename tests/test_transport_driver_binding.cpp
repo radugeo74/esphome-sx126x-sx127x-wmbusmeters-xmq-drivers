@@ -1,7 +1,7 @@
 // Regression: transport signature and approved XMQ decoder must bind to
 // the SAME driver even when YAML requests auto. Host only, public synthetic
 // application fixtures, no radio and no Home Assistant writer.
-#include "standalone_engine.h"
+#include "transport_driver_binding.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -9,21 +9,6 @@
 
 static void check(bool condition, const char *reason) {
   if (!condition) throw std::runtime_error(reason);
-}
-static bool decode_bound(const char *transport_driver,
-                         const xmq_standalone::Input &input,
-                         const std::string &selected_driver,
-                         xmq_runtime::XmqFrameResult &output) {
-  output = {};
-  if (transport_driver == nullptr ||
-      (selected_driver != "auto" && selected_driver != transport_driver))
-    return false;
-  if (!xmq_standalone::decode(input, output, transport_driver) ||
-      output.driver != transport_driver) {
-    output = {};
-    return false;
-  }
-  return true;
 }
 int main() {
   try {
@@ -44,28 +29,28 @@ int main() {
           "water transport signature");
     check(heat_transport != nullptr && std::string(heat_transport) == "fhkvdataiii",
           "heat transport signature");
-    check(decode_bound(water_transport, w, "auto", out) && out.driver == "mkradio4",
+    check(decode_transport_bound(water_transport, w, "auto", out) && out.driver == "mkradio4",
           "water auto must bind to transport driver");
-    check(decode_bound(heat_transport, h, "auto", out) && out.driver == "fhkvdataiii",
+    check(decode_transport_bound(heat_transport, h, "auto", out) && out.driver == "fhkvdataiii",
           "heat auto must bind to transport driver");
-    check(decode_bound(water_transport, w, "mkradio4", out),
+    check(decode_transport_bound(water_transport, w, "mkradio4", out),
           "explicit matching driver rejected");
     out.driver = "stale";
-    check(!decode_bound(water_transport, w, "fhkvdataiii", out) && out.driver.empty(),
+    check(!decode_transport_bound(water_transport, w, "fhkvdataiii", out) && out.driver.empty(),
           "explicit mismatched driver accepted");
     out.driver = "stale";
-    check(!decode_bound(heat_transport, w, "auto", out) &&
+    check(!decode_transport_bound(heat_transport, w, "auto", out) &&
           out.driver.empty() && out.numeric.empty(),
           "water application accepted against heat transport");
     out.driver = "stale";
-    check(!decode_bound(water_transport, h, "auto", out) &&
+    check(!decode_transport_bound(water_transport, h, "auto", out) &&
           out.driver.empty() && out.numeric.empty(),
           "heat application accepted against water transport");
     out.driver = "stale";
-    check(!decode_bound(nullptr, w, "auto", out) && out.driver.empty(),
+    check(!decode_transport_bound(nullptr, w, "auto", out) && out.driver.empty(),
           "unapproved transport admitted");
     w.trust = Trust::Ciphertext;
-    check(!decode_bound(water_transport, w, "auto", out) &&
+    check(!decode_transport_bound(water_transport, w, "auto", out) &&
           out.driver.empty() && out.numeric.empty(), "ciphertext admitted");
     std::cout << "XMQ_TRANSPORT_DRIVER_BOUND_FAIL_CLOSED_OK\n";
     return 0;
