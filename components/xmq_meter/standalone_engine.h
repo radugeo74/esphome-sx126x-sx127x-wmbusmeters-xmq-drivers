@@ -18,31 +18,37 @@ struct Input {
   std::vector<std::uint8_t> application;
   Trust trust{Trust::Unknown};
 };
+// Only reviewed end-to-end profiles are eligible for publication.
+// The catalog can contain additional XMQ files without activating them.
+inline const xmq_runtime::DriverRegistry &validated_registry() {
+  static const xmq_runtime::DriverRegistry registry({
+      xmq_runtime::load_driver(xmq_runtime::source_by_name("fhkvdataiii")),
+      xmq_runtime::load_driver(xmq_runtime::source_by_name("mkradio4"))});
+  return registry;
+}
+
 inline bool decode(const Input &input, xmq_runtime::XmqFrameResult &out,
                    const std::string &explicit_driver = "auto") noexcept {
   out = {};
   if (input.trust != Trust::VerifiedCleartext) return false;
   if (explicit_driver != "auto" && explicit_driver != "fhkvdataiii" &&
       explicit_driver != "mkradio4") return false;
-  if (input.family == Family::Heat && explicit_driver == "mkradio4") return false;
-  if (input.family == Family::Water && explicit_driver == "fhkvdataiii") return false;
   try {
-    if (input.family == Family::Heat) {
-      static const xmq_runtime::DriverRegistry registry({
-          xmq_runtime::load_driver(xmq_runtime::source_by_name("fhkvdataiii"))});
+    // Auto selects on the inner MVT, not on family defaults.
+    // Zero or multiple matching drivers fail closed in DriverRegistry::select.
+    const auto &registry = validated_registry();
+    const auto &selected = registry.select(
+        input.inner_mvt, explicit_driver == "auto" ? "" : explicit_driver);
+    if (selected.name == "fhkvdataiii" && input.family == Family::Heat)
       return xmq_runtime::decode_primary_candidate(
           registry, input.inner_mvt, input.encoding, input.application,
-          "fhkvdataiii",
+          selected.name,
           {"current_hca", "previous_hca", "temp_room_c", "temp_radiator_c"},
           {}, out);
-    }
-    if (input.family == Family::Water) {
-      static const xmq_runtime::DriverRegistry registry({
-          xmq_runtime::load_driver(xmq_runtime::source_by_name("mkradio4"))});
+    if (selected.name == "mkradio4" && input.family == Family::Water)
       return xmq_runtime::decode_primary_candidate(
           registry, input.inner_mvt, input.encoding, input.application,
-          "mkradio4", {"target_m3", "total_m3"}, {}, out);
-    }
+          selected.name, {"target_m3", "total_m3"}, {}, out);
   } catch (...) {
     out = {};
   }

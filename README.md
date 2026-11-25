@@ -99,3 +99,15 @@ The independent `mkradio4a.xmq` is discoverable in the generated
 catalog but is **not** enabled for production decoding by this change;
 its security envelope, field projection and fixtures need separate tests.
 No claim is made of universal automatic decoding for arbitrary XMQ files.
+
+### Auto selection from inner MVT (validated profiles)
+
+`driver: auto` now asks `DriverRegistry::select()` to choose the matching
+validated driver from the inner manufacturer/version/type (MVT).
+`family` is checked as an additional contract, not used as the driver
+selection mechanism. An unknown or ambiguous MVT and a family mismatch
+fail closed without publishing sensor values. The generated catalog can
+contain additional `.xmq` definitions, but no newly imported driver is
+allowed to publish until its transport/security and output-field profile
+is reviewed and explicitly enabled in the validated registry. Existing
+`driver: fhkvdataiii` and `driver: mkradio4` remain supported.

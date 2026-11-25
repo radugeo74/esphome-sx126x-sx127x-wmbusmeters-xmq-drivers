@@ -25,6 +25,10 @@ int main() {
           "unvalidated mkradio4a must not be silently activated");
     check(!decode(w,out,"bad") && out.numeric.empty(),
           "unknown driver admitted");
+    w.inner_mvt={"TCH",0x70,0x72};
+    check(decode(w,out,"auto"), "auto did not select MK4 alternate MVT");
+    check(out.driver=="mkradio4", "auto chose incorrect water driver");
+    w.inner_mvt={"TCH",0x95,0x62};
     w.trust=Trust::Unknown;
     check(!decode(w,out) && out.numeric.empty(), "unknown security admitted");
     w.trust=Trust::Ciphertext;
@@ -44,6 +48,10 @@ int main() {
     check(decode(h,out,"fhkvdataiii"), "explicit heat driver rejected");
     check(!decode(h,out,"mkradio4") && out.numeric.empty(),
           "water driver accepted for heat");
+    h.inner_mvt={"TCH",0x94,0x80};
+    check(decode(h,out,"auto"), "auto did not select FHK alternate MVT");
+    check(out.driver=="fhkvdataiii", "auto chose incorrect heat driver");
+    h.inner_mvt={"TCH",0x69,0x80};
     h.trust=Trust::Unknown;
     check(!decode(h,out) && out.numeric.empty(), "heat without trust admitted");
     std::cout << "XMQ_STANDALONE_HOST_OK: 7 heat + 5 water logical contracts, "
